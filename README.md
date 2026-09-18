@@ -647,6 +647,96 @@ removed and how to rebuild it.
 
 ---
 
+# GGUF / llama.cpp
+
+The same edit ships as a rank-1 LoRA adapter, so the published ternary GGUF stays
+byte-identical and the adapter is 9.7 MB.
+
+```bash
+python scripts/export_gguf_lora.py \
+    --checkpoint /path/to/Bonsai-2-27B-unfolded-fp16 \
+    --base-gguf  /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+    --out        bonsai-abliterate-lora.gguf
+```
+
+```bash
+llama-cli -m Ternary-Bonsai-2-27B-PTQ1_0.gguf --lora bonsai-abliterate-lora.gguf
+```
+
+`W' = W - r (r^T W)` is rank 1, so the whole edit is `A = r^T W`, `B = -r`. llama.cpp
+builds a LoRA into the graph as two extra matmuls on the activation and never merges it
+into the base weights — which is what makes this work at 1.75 bits, where a baked edit
+would simply be rounded away.
+
+## Strength
+
+`--lora` applies it at scale 1.0, and that is the projection exactly, not an
+approximation: llama.cpp computes `scale = adapter_scale * alpha / rank` with
+`rank = lora_b->ne[0]`, and the exporter writes `alpha = 1` against rank 1.
+
+Exact does not mean every prompt flips. Measured on the PTQ1_0 pack, greedy, thinking
+off:
+
+```text
+scale 0       the published model
+scale 1       exact projection; most harmful prompts comply, some still refuse
+scale 2       flips the stubborn ones
+scale 3+      over-projection; output degrades, then collapses
+```
+
+```bash
+llama-cli -m Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+    --lora-scaled bonsai-abliterate-lora.gguf:2
+```
+
+Read a single prompt as a sample of one. At full strength our own evaluation still had
+6% of AdvBench refusing, so one stubborn prompt tells you nothing about the strength.
+
+## You need PrismML's fork
+
+Stock llama.cpp cannot open these packs at all. `PTQ1_0` and `PQ2_0` are private ggml
+type ids — 143 and 142, outside upstream's range — so upstream refuses them at header
+parse. Even `gguf-py` raises:
+
+```text
+ValueError: np.uint32(143) is not a valid GGMLQuantizationType
+```
+
+which is why `bonsai_abliterate/gguf_min.py` reads the base header directly. Writing the
+adapter still uses `gguf-py`, since an adapter holds only standard F32 tensors.
+
+The published `Ternary-Bonsai-2-27B-F16.gguf` is **not** an escape hatch. It uses
+standard tensor types, so stock llama.cpp and Ollama will load it — but it is stored in
+the same Hadamard-rotated basis and carries the same `prism.hadamard.*` metadata, which
+upstream ignores entirely. It would run and emit nonsense rather than fail.
+
+**Ollama has no path today.** It builds stock llama.cpp, so it inherits the rejection of
+the private types; `ADAPTER` parses but `ollama create` rejects every request carrying
+adapters with "LoRA adapters are no longer supported"; and it has no control-vector
+support.
+
+## What is verified
+
+The exported `B @ A` reproduces `-r (r^T W)` exactly — relative error `0.000e+00` on
+`ffn_down`, `attn_output`, `ssm_out` and `token_embd` — and the direction's leakage into
+each falls about six orders of magnitude. Against the fork, the adapter loads on the
+ternary pack, scale 0 reproduces the published refusal and scale 100 destroys the model,
+so it is genuinely in the compute graph. All 129 sites are on LoRA-aware paths:
+`ffn_down` through `build_ffn`'s `build_lora_mm`, `attn_output` and `ssm_out` inline in
+`qwen35.cpp`, `token_embd` in `build_inp_embd`.
+
+Two things are not. **PQ2_0 was not run** — the adapter does not depend on the base's
+quantization, and all three published GGUFs carry the same 851 tensor names, so the same
+file should apply, but only PTQ1_0 was tested. And the exporter needs the **unfolded fp16
+checkpoint**, which this repo does not ship; without it there is nothing to compute
+`r^T W` against.
+
+A LoRA on a tensor llama.cpp does not route through `build_lora_mm` loads without error
+and does nothing at all. Check that scale 0 reproduces the published model and that a
+large scale visibly breaks it — if neither is true, the adapter is not being applied.
+
+---
+
 # Running on x86 Linux
 
 The pack's quantized matrix multiplication currently has kernels for:
