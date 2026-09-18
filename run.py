@@ -221,6 +221,7 @@ def main(argv=None):
         else:
             drafter = dflash.load_drafter(args.draft, model)
             mma.install()
+            mma.install_drafter(drafter)
             speculator = spec.Speculator(model, drafter, stops, min_gain=args.spec_min_gain)
             log(f"[spec] drafter loaded: block {speculator.bs}, taps {speculator.tap}")
 
