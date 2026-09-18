@@ -5,6 +5,46 @@ import sys
 from pathlib import Path
 
 
+def resolve_pack(pack_dir: str | Path) -> Path:
+    """Return the directory that actually holds the pack, and say so if it does not.
+
+    `huggingface_hub` stores a download as `models--org--name/snapshots/<sha>/`, with
+    `blobs/` and `refs/` beside it. Pointing at the `models--...` directory itself is the
+    obvious thing to try and it lands one level too high: nothing is there, so
+    `runtime/` does not exist, and the failure used to surface much later as
+    `ModuleNotFoundError: No module named 'vision_artifact'` -- which says nothing about
+    the real problem. Resolve that layout, and otherwise fail here with the reason.
+    """
+    pack_dir = Path(pack_dir).expanduser()
+    if not pack_dir.exists():
+        raise FileNotFoundError(f"no such directory: {pack_dir}")
+
+    if not (pack_dir / "config.json").exists():
+        snapshots = pack_dir / "snapshots"
+        if snapshots.is_dir():
+            # An HF cache entry. Take the newest snapshot that is actually a pack.
+            candidates = sorted((d for d in snapshots.iterdir()
+                                 if (d / "config.json").exists()),
+                                key=lambda d: d.stat().st_mtime, reverse=True)
+            if candidates:
+                return candidates[0]
+            raise FileNotFoundError(
+                f"{pack_dir} is a huggingface cache entry but none of its snapshots "
+                f"contain config.json -- the download may be incomplete")
+        raise FileNotFoundError(
+            f"{pack_dir} does not look like a pack: no config.json.\n"
+            f"If you downloaded with huggingface_hub, pass the snapshot directory:\n"
+            f"  python -c \"from huggingface_hub import snapshot_download; "
+            f"print(snapshot_download('prism-ml/Ternary-Bonsai-2-27B-mlx-2bit'))\"")
+
+    if not (pack_dir / "runtime" / "vision_artifact.py").exists():
+        raise FileNotFoundError(
+            f"{pack_dir} has a config.json but no runtime/vision_artifact.py. The pack "
+            f"must be downloaded whole -- its own loader is the only one that applies "
+            f"the Hadamard transform these weights require.")
+    return pack_dir
+
+
 def load_pack(pack_dir: str | Path, load_processor: bool = False):
     """Load a Prism Hadamard pack via its own bundled runtime.
 
@@ -18,7 +58,7 @@ def load_pack(pack_dir: str | Path, load_processor: bool = False):
     Ordinary MLX loaders will appear to work and silently compute nonsense, because they
     do not apply the Hadamard activation transform the stored weights require.
     """
-    pack_dir = Path(pack_dir)
+    pack_dir = resolve_pack(pack_dir)
     runtime = str(pack_dir / "runtime")
     if runtime not in sys.path:
         sys.path.insert(0, runtime)
