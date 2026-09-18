@@ -144,6 +144,9 @@ which enables the full runtime projection.
 
 ![OrcaBonsai 27B Uncensored evaluation results](./evals.jpg)
 
+Full tables with capability retention, sample sizes and methodology are under
+[Evaluation](#evaluation) — including what the asterisk on SimpleSafetyTests means.
+
 # Verify the ablation
 
 Run:
