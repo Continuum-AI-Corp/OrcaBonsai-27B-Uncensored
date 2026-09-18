@@ -254,13 +254,17 @@ Measured on an M1 Ultra, ablation on, `--max-new 300`:
 
 ```text
                                    plain      --draft
-code (CSV parser function)         27.6       38.6 tok/s   60 rounds, 4.98 tokens/round
+code (CSV parser function)         27.7       39.0 tok/s   60 rounds, 4.98 tokens/round
 follow-up turn on the same code    27.5       44.4 tok/s   5.45 tokens/round
 Chinese essay                      26.8       26.8 tok/s   gave up after 10 rounds at 2.0
 ```
 
-A round costs about 3.4 plain steps (draft ~16 ms, verify ~105 ms against a 37 ms
-step), so it pays only when rounds average more than that. The drafter's own 4-bit
+A round costs about 3.3 plain steps (draft ~16 ms, verify ~100 ms against a 36 ms
+step), so it pays only when rounds average more than that. What is left in a round is
+spread thin: the drafter's own matmuls are at the same tile-kernel wall as the
+target's, and the attention and MLP glue at 8 rows is a few hundred microseconds per
+layer across a dozen small launches; each remaining item is worth 1–3% and sits below
+the run-to-run noise of a warm M1 Ultra (the same forward drifts 107–121 ms). The drafter's own 4-bit
 linears also go through a tile kernel for 6–8 rows (`mma.install_drafter`), worth 4 ms
 per round; below 6 rows and on its narrow projections the stock kernel is faster. Code and structured text do;
 prose does not. `run.py` therefore watches the reply's mean tokens per round and, once
