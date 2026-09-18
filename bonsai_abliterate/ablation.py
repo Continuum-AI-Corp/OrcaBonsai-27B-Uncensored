@@ -65,22 +65,6 @@ class Ablated(nn.Module):
         return (yf - self._alpha * component * self._direction).astype(y.dtype)
 
 
-def set_alpha(model, alpha: float) -> int:
-    """Change the projection strength on an already-wrapped model. Returns site count.
-
-    Cheap enough to drive from a UI: the wrappers hold alpha as a plain scalar, so
-    nothing is reloaded or recompiled. 0 gives the pack's original behaviour and 1 the
-    full projection, which makes the two directly comparable on the same weights in the
-    same process -- the weights never being touched is the point.
-    """
-    n = 0
-    for _, module in model.named_modules():
-        if isinstance(module, Ablated):
-            module._alpha = float(alpha)
-            n += 1
-    return n
-
-
 def load_direction(path: str | Path) -> tuple[mx.array, dict]:
     """Load a unit refusal direction and its metadata from a safetensors file."""
     arrays, meta = mx.load(str(path), return_metadata=True)
