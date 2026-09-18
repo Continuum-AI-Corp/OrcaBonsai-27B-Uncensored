@@ -109,23 +109,41 @@ def main(argv=None):
 
     language_model = model.language_model
 
-    def answer(prompt: str):
-        ids = tok.encode(render_chat(args.pack, prompt, enable_thinking=args.thinking),
+    history: list[dict] = []
+
+    def answer(prompt: str, remember: bool) -> str:
+        # The whole conversation is re-rendered and re-prefilled every turn. That is
+        # what the chat template expects, and it keeps the reply consistent with how
+        # the model was trained; the cost is that a long history gets slower to start.
+        turns = history + [{"role": "user", "content": prompt}]
+        ids = tok.encode(render_chat(args.pack, turns, enable_thinking=args.thinking),
                          add_special_tokens=False).ids
         log(f"\n>>> {prompt}\n[{len(ids)} prompt tokens]")
-        _, elapsed, n = generate(language_model, tok, ids, stops,
-                                 args.max_new, args.temp, args.top_p)
+        reply, elapsed, n = generate(language_model, tok, ids, stops,
+                                     args.max_new, args.temp, args.top_p)
         log(f"[{n} tokens in {elapsed:.1f}s = {n/max(elapsed,1e-9):.2f} tok/s]")
+        if remember:
+            history.append({"role": "user", "content": prompt})
+            history.append({"role": "assistant", "content": reply})
+        return reply
 
+    # Prompts given on the command line are independent questions; only --interactive
+    # is a conversation.
     for prompt in args.prompts:
-        answer(prompt)
+        answer(prompt, remember=False)
 
     if args.interactive:
-        log("\n[interactive] one prompt per line, Ctrl-D to exit")
+        log("\n[chat] one message per line. /reset clears the history, Ctrl-D exits.")
         for line in sys.stdin:
             line = line.strip()
-            if line:
-                answer(line)
+            if not line:
+                continue
+            if line in ("/reset", "/clear"):
+                history.clear()
+                log("[chat] history cleared")
+                continue
+            answer(line, remember=True)
+            log(f"[chat] {len(history) // 2} turns in history")
     return 0
 
 

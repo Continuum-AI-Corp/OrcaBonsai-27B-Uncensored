@@ -40,8 +40,13 @@ def load_tokenizer(pack_dir: str | Path):
     return Tokenizer.from_file(str(Path(pack_dir) / "tokenizer.json"))
 
 
-def render_chat(pack_dir: str | Path, prompt: str, enable_thinking: bool = False) -> str:
-    """Render one user turn through the pack's own chat template.
+def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = False) -> str:
+    """Render a conversation through the pack's own chat template.
+
+    ``conversation`` is either a single user prompt or a list of
+    ``{"role": ..., "content": ...}`` messages. Multi-turn works by re-rendering the
+    whole history each turn, which is what the template expects: the assistant turns
+    have to be inside it, or the model answers every question as if it were the first.
 
     ``enable_thinking=False`` emits a closed, empty think block so the reply is a direct
     answer. The model defaults to extended reasoning otherwise, which is usually not
@@ -49,11 +54,13 @@ def render_chat(pack_dir: str | Path, prompt: str, enable_thinking: bool = False
     """
     import jinja2
 
+    messages = ([{"role": "user", "content": conversation}]
+                if isinstance(conversation, str) else list(conversation))
     template = (Path(pack_dir) / "chat_template.jinja").read_text()
     env = jinja2.Environment(trim_blocks=False, lstrip_blocks=False)
     env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
     return env.from_string(template).render(
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
