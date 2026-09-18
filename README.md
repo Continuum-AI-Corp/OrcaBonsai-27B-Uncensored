@@ -751,10 +751,17 @@ so it is genuinely in the compute graph. All 129 sites are on LoRA-aware paths:
 `ffn_down` through `build_ffn`'s `build_lora_mm`, `attn_output` and `ssm_out` inline in
 `qwen35.cpp`, `token_embd` in `build_inp_embd`.
 
-One thing is not: **PQ2_0 was not run.** The adapter does not depend on the base's
-quantization — `A = r^T W` comes from the unfolded checkpoint and the base GGUF is read
-only for tensor names — and all three published GGUFs carry the same 851 names, so the
-same file should apply. Only PTQ1_0 was actually tested.
+**PQ2_0 is verified too**, on the fork's `prism-b10685` macOS Metal build: the same
+adapter loads on `Ternary-Bonsai-2-27B-PQ2_0.gguf`, scale 0 reproduces the published
+refusal and scale 1 answers the same prompt. That was expected rather than surprising:
+the adapter does not depend on the base's quantization — `A = r^T W` comes from the
+unfolded checkpoint and the base GGUF is read only for tensor names — and all three
+published GGUFs carry the same 851 names.
+
+Speed on an M1 Ultra, greedy, 300-token reply: PTQ1_0 24.9 tok/s base, 23.9 with the
+adapter; PQ2_0 25.4 and 24.5. The MLX path in this repo measures 25.2 with the ablation
+on the same prompt, so on that machine the two routes are interchangeable; the fork's
+prefill is faster (80–87 tok/s at 25 tokens, 180–220 on `llama-bench pp512`).
 
 A LoRA on a tensor llama.cpp does not route through `build_lora_mm` loads without error
 and does nothing at all. Check that scale 0 reproduces the published model and that a
