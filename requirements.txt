@@ -1,0 +1,11 @@
+# Versions the pack's own runtime pins. mlx-metal comes in automatically with mlx on
+# Apple Silicon; on x86 Linux add mlx-cpu==0.32.0, because there the plain mlx wheel
+# carries no libmlx.so and there is no CUDA kernel for the pack's quantized matmul.
+mlx==0.32.0
+mlx-lm==0.31.3
+mlx-vlm==0.6.3
+transformers==5.5.0
+numpy>=2.0
+tokenizers>=0.21
+jinja2>=3.1
+pillow>=10.0

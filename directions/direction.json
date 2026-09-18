@@ -1,0 +1,25 @@
+{
+  "model": "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+  "hidden_size": 5120,
+  "dtype": "float32",
+  "layout": "unit-norm vector in the plain (unrotated) hidden basis",
+  "files": {
+    "refusal_dir.safetensors": "for MLX / Python; tensor key 'direction'",
+    "refusal_dir_fp32.bin": "5120 little-endian float32, no header; for Swift and C"
+  },
+  "apply": "y -= alpha * dot(y, d) * d, accumulated in float32, on the output of every module that writes the residual stream",
+  "residual_writers": {
+    "mlp.down_proj": 64,
+    "linear_attn.out_proj": 48,
+    "self_attn.o_proj": 16,
+    "model.embed_tokens": 1,
+    "total": 129
+  },
+  "alpha": {
+    "default": 1.0,
+    "meaning": "1.0 matches a full permanent weight edit; lower trades ablation strength for capability retention; 0 disables"
+  },
+  "hadamard_handling": "none required; the rotation is folded on the input dimension only, while this projection acts on outputs",
+  "verified": "With all 129 writers wrapped, the residual component along the direction falls to ~1e-6 of the residual norm across depth, measured on the 2-bit pack itself. The packed weights are unchanged, so no quantization error is added.",
+  "caveat": "The direction was estimated on the bf16 base model this pack was trained from. Architecture and hidden basis are identical, but how well it transfers across the quantization-aware training has not been measured yet. Sweep alpha if the effect is weaker than expected."
+}
