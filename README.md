@@ -281,6 +281,26 @@ stream it reads; measured acceptance on code was 4.1–5.6 tokens per round with
 ablation on, against the 94% (about 6.5 per round) its author reports on the
 unablated bf16 target.
 
+`--lookup` adds copy drafts: when the last four tokens occurred earlier in the
+conversation and a full block followed them, that block is verified instead of running
+the drafter (prompt-lookup decoding). Measured, it does not pay against this drafter:
+
+```text
+                         drafter only          drafter + lookup
+repeat a module verbatim 45.8   7.84/round      46.7   6.97/round (35 of 36 rounds copied)
+rename a class           45.5   7.84/round      42.0   6.44/round
+edit: add type hints     44.8   7.10/round      43.7   6.33/round
+CSV function (no source) 42.0   5.12/round      39.2   4.87/round (4 spurious copies)
+```
+
+Two reasons. The DFlash head already reaches 7.8 of a possible 8 on re-emitted code,
+so a free draft can only save the ~16 ms drafter call, not raise acceptance. And a copy
+from the prompt carries the tokenizer's canonical BPE split, while the target emits its
+own split of the same text (the effect that also rules out re-tokenising history for the
+cache), so identical text is still rejected at token level. Copies of the model's own
+earlier output match exactly, but those are the spans the drafter handles best. Kept as
+an option for drafter-less setups; off by default.
+
 The M1 family has no matrix hardware in the GPU, so the tile matmul is 2.7x slower than
 the stock kernel at one row and is used only for 4–8 rows; on chips with matrix units
 (M5 family) the same kernel would also carry plain decoding and the arithmetic above

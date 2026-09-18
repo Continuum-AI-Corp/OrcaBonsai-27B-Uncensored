@@ -63,6 +63,10 @@ def parse_args(argv=None):
                    help="fall back to plain decoding for the rest of a reply once ten or more "
                         "rounds have averaged fewer tokens than this per round (a round costs "
                         "about 3.7 plain steps on an M1 Ultra)")
+    p.add_argument("--lookup", action="store_true",
+                   help="in speculative mode, draft by copying the continuation of the last "
+                        "4-gram's earlier occurrence when a full block is available (measured "
+                        "no gain over the drafter on this pack; see README)")
     p.add_argument("--no-fused", action="store_true",
                    help="run the pack runtime's own per-op decode path instead of the fused "
                         "linear-attention kernel (slower; useful for A/B checks)")
@@ -233,7 +237,8 @@ def main(argv=None):
             drafter = dflash.load_drafter(args.draft, model)
             mma.install()
             mma.install_drafter(drafter)
-            speculator = spec.Speculator(model, drafter, stops, min_gain=args.spec_min_gain)
+            speculator = spec.Speculator(model, drafter, stops, min_gain=args.spec_min_gain,
+                                         lookup_n=4 if args.lookup else 0)
             log(f"[spec] drafter loaded: block {speculator.bs}, taps {speculator.tap}")
 
     history: list[dict] = []
