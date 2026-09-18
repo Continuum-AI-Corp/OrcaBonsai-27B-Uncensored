@@ -66,14 +66,23 @@ def sample(logits, temp, top_p):
     return order[choice]
 
 
-def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True):
-    """Decode until a stop token or the budget. Returns (text, seconds, n, truncated).
+def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True,
+             cache=None):
+    """Decode until a stop token or the budget.
 
-    ``truncated`` is True when the budget ran out before a stop token. The caller
-    should say so: a reply cut off mid-sentence with no marker looks like the model
-    broke, when it only ran out of room.
+    Returns ``(text, seconds, n, truncated, consumed)``. ``truncated`` is True when the
+    budget ran out before a stop token; the caller should say so, because a reply cut
+    off mid-sentence with no marker looks like the model broke when it only ran out of
+    room. ``consumed`` is every token the cache has now seen: ``ids``, the reply, and
+    the stop token when there was one (the lookahead below feeds it before the loop
+    can see it). A caller that keeps ``cache`` for the next turn needs that list to
+    know what the cache already holds.
+
+    ``cache`` is the model's own cache list to continue from, with ``ids`` being only
+    the tokens it has not seen yet; None starts fresh.
     """
-    cache = language_model.make_cache() if hasattr(language_model, "make_cache") else None
+    if cache is None:
+        cache = language_model.make_cache() if hasattr(language_model, "make_cache") else None
     produced, t0 = [], time.time()
 
     def step(x):
@@ -88,10 +97,12 @@ def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True)
     token = step(mx.array([ids], dtype=mx.int32))
     mx.async_eval(token)
     truncated = True
+    consumed = list(ids)
     for _ in range(max_new):
         following = step(token.reshape(1, 1))
         mx.async_eval(following)
         current = int(token.item())
+        consumed.append(current)
         if current in stops:
             truncated = False
             break
@@ -103,7 +114,7 @@ def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True)
     if stream:
         sys.stdout.write("\n")
     elapsed = time.time() - t0
-    return tok.decode(produced), elapsed, len(produced), truncated
+    return tok.decode(produced), elapsed, len(produced), truncated, consumed
 
 
 def main(argv=None):
@@ -132,17 +143,51 @@ def main(argv=None):
     language_model = model.language_model
 
     history: list[dict] = []
+    # The cache carried between turns, and the token ids it has already consumed.
+    # Re-tokenising the rendered history would not reproduce those ids: a model's own
+    # output is not the canonical BPE tokenisation of its text (a 1220-token Chinese
+    # reply re-tokenised to 1221 and diverged at the first word). So the next turn is
+    # built as the tokens the cache has seen plus only the text the template appends
+    # after them, which is what the model would have seen had the whole thing been
+    # rendered at once. Prefill runs at ~80-100 tok/s here, so without this a 4K-token
+    # history would cost the better part of a minute before each reply.
+    session = {"ids": [], "cache": None}
+    im_end = tok.token_to_id("<|im_end|>")
+
+    def continuation(prompt: str):
+        """Tokens to feed on top of the session cache for a new user turn, or None."""
+        if session["cache"] is None:
+            return None
+        before = render_chat(args.pack, history, enable_thinking=args.thinking,
+                             add_generation_prompt=False)
+        after = render_chat(args.pack, history + [{"role": "user", "content": prompt}],
+                            enable_thinking=args.thinking)
+        cut = before.rfind("<|im_end|>")
+        if cut < 0 or not after.startswith(before):
+            return None
+        delta = after[cut:]
+        if session["ids"] and session["ids"][-1] == im_end:
+            # The cache already holds the turn terminator (generation stopped on it).
+            delta = delta[len("<|im_end|>"):]
+        return tok.encode(delta, add_special_tokens=False).ids
 
     def answer(prompt: str, remember: bool) -> str:
-        # The whole conversation is re-rendered and re-prefilled every turn. That is
-        # what the chat template expects, and it keeps the reply consistent with how
-        # the model was trained; the cost is that a long history gets slower to start.
         turns = history + [{"role": "user", "content": prompt}]
-        ids = tok.encode(render_chat(args.pack, turns, enable_thinking=args.thinking),
-                         add_special_tokens=False).ids
-        log(f"\n>>> {prompt}\n[{len(ids)} prompt tokens]")
-        reply, elapsed, n, truncated = generate(language_model, tok, ids, stops,
-                                                args.max_new, args.temp, args.top_p)
+        new_ids = continuation(prompt) if remember else None
+        if new_ids:
+            cache, seen = session["cache"], len(session["ids"])
+            log(f"\n>>> {prompt}\n[{seen + len(new_ids)} prompt tokens, {seen} cached, "
+                f"{len(new_ids)} to prefill]")
+        else:
+            cache = language_model.make_cache()
+            new_ids = tok.encode(render_chat(args.pack, turns, enable_thinking=args.thinking),
+                                 add_special_tokens=False).ids
+            session["ids"] = []
+            log(f"\n>>> {prompt}\n[{len(new_ids)} prompt tokens]")
+
+        reply, elapsed, n, truncated, consumed = generate(
+            language_model, tok, new_ids, stops, args.max_new, args.temp, args.top_p,
+            cache=cache)
         log(f"[{n} tokens in {elapsed:.1f}s = {n/max(elapsed,1e-9):.2f} tok/s]")
         if truncated:
             # Always shown, even with --quiet: the cut-off reply is otherwise
@@ -152,6 +197,8 @@ def main(argv=None):
         if remember:
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": reply})
+            session["ids"] = session["ids"] + consumed
+            session["cache"] = cache
         return reply
 
     # Prompts given on the command line are independent questions; only --interactive
@@ -167,6 +214,7 @@ def main(argv=None):
                 continue
             if line in ("/reset", "/clear"):
                 history.clear()
+                session["ids"], session["cache"] = [], None
                 log("[chat] history cleared")
                 continue
             answer(line, remember=True)

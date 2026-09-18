@@ -151,7 +151,10 @@ alpha = 1
 which enables the full runtime projection.
 
 Quote the prompt: each unquoted word is answered as a separate prompt. For a
-conversation use `--interactive` (`/reset` clears the history, Ctrl-D exits).
+conversation use `--interactive` (`/reset` clears the history, Ctrl-D exits). Each turn
+continues the previous turn's cache rather than re-prefilling the whole history: the
+`[N prompt tokens, M cached, K to prefill]` line says how much was reused. Measured on
+an M1 Ultra, a short question after a 1,246-token reply went from 8.7 s to 1.6 s.
 
 Replies stop at a stop token or at `--max-new` (4096 tokens by default). A reply that
 hits the budget is cut off mid-sentence and a `[cut off at --max-new ...]` line says

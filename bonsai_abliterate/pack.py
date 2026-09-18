@@ -83,7 +83,8 @@ def load_tokenizer(pack_dir: str | Path):
     return Tokenizer.from_file(str(resolve_pack(pack_dir) / "tokenizer.json"))
 
 
-def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = False) -> str:
+def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = False,
+                add_generation_prompt: bool = True) -> str:
     """Render a conversation through the pack's own chat template.
 
     ``conversation`` is either a single user prompt or a list of
@@ -94,6 +95,10 @@ def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = Fals
     ``enable_thinking=False`` emits a closed, empty think block so the reply is a direct
     answer. The model defaults to extended reasoning otherwise, which is usually not
     what you want when checking behaviour.
+
+    ``add_generation_prompt=False`` renders the conversation as history only, ending
+    after the last turn's ``<|im_end|>``; run.py uses that to find the exact text the
+    template appends for a new turn without re-tokenising the earlier ones.
     """
     import jinja2
 
@@ -104,7 +109,7 @@ def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = Fals
     env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
     return env.from_string(template).render(
         messages=messages,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
     )
 
