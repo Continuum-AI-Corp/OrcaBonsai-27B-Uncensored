@@ -140,6 +140,9 @@ alpha = 1
 which enables the full runtime projection.
 
 ---
+## Evaluation Results
+
+![OrcaBonsai 27B Uncensored evaluation results](./evals.jpg)
 
 # Verify the ablation
 
