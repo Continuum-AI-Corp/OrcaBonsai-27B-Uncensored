@@ -35,7 +35,9 @@ def parse_args(argv=None):
     p.add_argument("--direction", default=str(DEFAULT_DIRECTION), help="refusal direction safetensors")
     p.add_argument("--alpha", type=float, default=1.0,
                    help="projection strength; 1.0 matches a full weight edit, 0 disables it")
-    p.add_argument("--max-new", type=int, default=256, help="maximum tokens to generate")
+    p.add_argument("--max-new", type=int, default=4096,
+                   help="generation budget in tokens; a reply that hits it is cut off "
+                        "mid-sentence and flagged")
     p.add_argument("--temp", type=float, default=0.0, help="sampling temperature; 0 is greedy")
     p.add_argument("--top-p", type=float, default=0.95, help="nucleus cutoff when --temp > 0")
     p.add_argument("--thinking", action="store_true",
@@ -65,13 +67,21 @@ def sample(logits, temp, top_p):
 
 
 def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True):
+    """Decode until a stop token or the budget. Returns (text, seconds, n, truncated).
+
+    ``truncated`` is True when the budget ran out before a stop token. The caller
+    should say so: a reply cut off mid-sentence with no marker looks like the model
+    broke, when it only ran out of room.
+    """
     cache = language_model.make_cache() if hasattr(language_model, "make_cache") else None
     produced, t0 = [], time.time()
     prompt = mx.array([ids], dtype=mx.int32)
+    truncated = True
     for _ in range(max_new):
         out = language_model(prompt, cache=cache)
         token = int(sample(out.logits[0, -1].astype(mx.float32), temp, top_p).item())
         if token in stops:
+            truncated = False
             break
         produced.append(token)
         if stream:
@@ -81,7 +91,7 @@ def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True)
     if stream:
         sys.stdout.write("\n")
     elapsed = time.time() - t0
-    return tok.decode(produced), elapsed, len(produced)
+    return tok.decode(produced), elapsed, len(produced), truncated
 
 
 def main(argv=None):
@@ -119,9 +129,14 @@ def main(argv=None):
         ids = tok.encode(render_chat(args.pack, turns, enable_thinking=args.thinking),
                          add_special_tokens=False).ids
         log(f"\n>>> {prompt}\n[{len(ids)} prompt tokens]")
-        reply, elapsed, n = generate(language_model, tok, ids, stops,
-                                     args.max_new, args.temp, args.top_p)
+        reply, elapsed, n, truncated = generate(language_model, tok, ids, stops,
+                                                args.max_new, args.temp, args.top_p)
         log(f"[{n} tokens in {elapsed:.1f}s = {n/max(elapsed,1e-9):.2f} tok/s]")
+        if truncated:
+            # Always shown, even with --quiet: the cut-off reply is otherwise
+            # indistinguishable from the model stopping on its own.
+            print(f"[cut off at --max-new {args.max_new}; raise it for a complete reply]",
+                  file=sys.stderr, flush=True)
         if remember:
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": reply})

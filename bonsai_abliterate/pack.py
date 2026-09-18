@@ -74,10 +74,13 @@ def load_tokenizer(pack_dir: str | Path):
     ``AutoTokenizer`` resolves classes through ``config.json``'s ``model_type``, which
     is deliberately ``prism_hadamard_qwen35`` here, so reading ``tokenizer.json``
     directly is both simpler and more reliable.
+
+    Goes through ``resolve_pack`` like ``load_pack`` does, so an HF cache entry works
+    here too instead of failing on a missing ``tokenizer.json`` after the model loaded.
     """
     from tokenizers import Tokenizer
 
-    return Tokenizer.from_file(str(Path(pack_dir) / "tokenizer.json"))
+    return Tokenizer.from_file(str(resolve_pack(pack_dir) / "tokenizer.json"))
 
 
 def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = False) -> str:
@@ -96,7 +99,7 @@ def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = Fals
 
     messages = ([{"role": "user", "content": conversation}]
                 if isinstance(conversation, str) else list(conversation))
-    template = (Path(pack_dir) / "chat_template.jinja").read_text()
+    template = (resolve_pack(pack_dir) / "chat_template.jinja").read_text()
     env = jinja2.Environment(trim_blocks=False, lstrip_blocks=False)
     env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
     return env.from_string(template).render(

@@ -150,6 +150,15 @@ alpha = 1
 
 which enables the full runtime projection.
 
+Quote the prompt: each unquoted word is answered as a separate prompt. For a
+conversation use `--interactive` (`/reset` clears the history, Ctrl-D exits).
+
+Replies stop at a stop token or at `--max-new` (4096 tokens by default). A reply that
+hits the budget is cut off mid-sentence and a `[cut off at --max-new ...]` line says
+so; raise the budget. `--thinking` spends the same budget on the reasoning first, so
+give it more room. The evaluation numbers below were run with much smaller budgets;
+those are measurement settings, not chat settings.
+
 ---
 ## Evaluation Results
 
