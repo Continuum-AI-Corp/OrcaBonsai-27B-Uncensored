@@ -197,6 +197,15 @@ Expected:
 129 residual writers
 ```
 
+`scripts/bench_decode.py` reports where a decode step's time goes on your machine: the
+step with and without the ablation, the 401 quantized matmuls alone and what the
+Hadamard transform costs, the split by block type, and how cost grows with the number
+of tokens per step. On an M1 Ultra it shows the pack is not bandwidth-bound: MLX's 2-bit
+matmul kernel is ALU-bound at ~310–370 GB/s while the 4-bit kernel streams 651 GB/s on
+the same GPU, and matmul cost grows almost linearly with tokens per step up to 16, which
+is why speculative decoding does not pay on this pack. Run it before trusting any speed
+estimate for a different machine.
+
 ---
 
 # Original vs. uncensored
