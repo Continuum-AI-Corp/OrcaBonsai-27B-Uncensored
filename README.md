@@ -226,17 +226,53 @@ two cost; a two-launch fp16 Hadamard gained nothing and lost precision. The step
 mostly the serial sum of the matmuls' own times (~32 ms of the 35), which is the
 kernel-level limit discussed below.
 
-**Speculative decoding** is not wired in, and the measurement that decides whether it
-can be is in `scripts/proto_tern_mma.py`. MLX's quantized matmul costs almost linearly
-in the number of tokens in flight up to 8 on this pack (verifying 5 draft tokens costs
-3.2 plain steps), which is why community ports report only 1.07–1.13x on Bonsai. A
-matmul on `simdgroup_matrix` tiles is flat in M and verifies 8 tokens for 2.55x the
-matmul cost of a plain step, but on an M1 Ultra those tiles run on the ordinary FP32
-ALUs (3.48 TMAC/s measured), so it is 2.7x slower than the stock kernel at M=1 and only
-pays from M=4 on. Net: with the published DFlash2 drafter, code-like workloads (94%
-acceptance) would decode around 2x faster and chat-like ones slower, so an integration
-has to pick the path per step. Chips with matrix hardware in the GPU (M5 family) change
-this arithmetic.
+## Speculative decoding
+
+`run.py --draft <dir>` decodes with the published DFlash 2 drafter for this model
+([nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX),
+a 4-bit quantisation of Inco AI's `Qwen3.8-27B-DFlash2` head; `<dir>` is the snapshot
+holding `dflash/config.json` and `dflash/model.safetensors`). Greedy only, and the output
+is what plain greedy decoding produces, up to kernel rounding at near-ties: checked
+token-for-token on a 300-token code reply and a three-turn session.
+
+```bash
+python run.py --pack /path/to/pack --draft /path/to/drafter-snapshot --interactive
+```
+
+Each round drafts 7 tokens in one drafter forward (1.9B parameters, conditioned on the
+target's residual stream at layers 5, 19, 33, 47 and 61), verifies them in one target
+forward over 8 tokens, accepts the longest prefix the target agrees with plus its own
+next token, and rolls the caches back to exactly the accepted tokens. Three pieces make
+the verify pass affordable on this pack: `bonsai_abliterate/mma.py` runs the 2-bit
+matmuls on `simdgroup_matrix` tiles for 4–8 rows (flat in the row count, 70 ms for all
+401 against 162 ms with the stock kernel at 8 rows); the fused linear-attention kernel
+handles up to 8 tokens per call with the recurrent state in registers; and rollback
+replays the accepted prefix through that kernel from recorded inputs instead of
+snapshotting per-position states (1.2 GB per round on the runtime's own path).
+
+Measured on an M1 Ultra, ablation on, `--max-new 300`:
+
+```text
+                                   plain      --draft
+code (CSV parser function)         27.6       36.6 tok/s   60 rounds, 5.02 tokens/round
+follow-up turn on the same code    27.5       46.9 tok/s   5.64 tokens/round
+Chinese essay                      26.8       26.8 tok/s   gave up after 10 rounds at 2.0
+```
+
+A round costs about 3.7 plain steps (draft ~20 ms, verify ~110 ms against a 37 ms
+step), so it pays only when rounds average more than that. Code and structured text do;
+prose does not. `run.py` therefore watches the reply's mean tokens per round and, once
+ten rounds average below `--spec-min-gain` (3.5), finishes the reply with plain
+decoding; the ten probing rounds cost about 3% on a prose reply. The drafter was trained
+against the bf16 base, not the ternary pack, and the ablation changes the residual
+stream it reads; measured acceptance on code was 4.1–5.6 tokens per round with the
+ablation on, against the 94% (about 6.5 per round) its author reports on the
+unablated bf16 target.
+
+The M1 family has no matrix hardware in the GPU, so the tile matmul is 2.7x slower than
+the stock kernel at one row and is used only for 4–8 rows; on chips with matrix units
+(M5 family) the same kernel would also carry plain decoding and the arithmetic above
+changes.
 
 `scripts/bench_decode.py` reports where a decode step's time goes on your machine: the
 step with and without the ablation, the 401 quantized matmuls alone and what the

@@ -39,124 +39,140 @@ from __future__ import annotations
 import mlx.core as mx
 
 _SOURCE = r"""
-    // One threadgroup per value head. Layout of the conv channels: q (HK*DK), k (HK*DK),
-    // v (HV*DV); the conv input is the 3 cached steps followed by the current one.
-    constexpr int KD = HK * DK;            // key_dim
-    constexpr int CD = 2 * KD + HV * DV;   // conv_dim
+    // One threadgroup per value head; T tokens processed in sequence with the head's
+    // recurrent state held in registers throughout. Conv channel layout: q (HK*DK),
+    // k (HK*DK), v (HV*DV); the conv window is the TAPS-1 cached rows followed by the
+    // T new rows of `mixed`.
+    constexpr int KD = HK * DK;
+    constexpr int CD = 2 * KD + HV * DV;
     constexpr int TAPS = 4;
+    constexpr int CH = DK / 8;
     const uint h  = threadgroup_position_in_grid.x;
     const uint t  = thread_position_in_threadgroup.x;
     const uint hk = h / (HV / HK);
     const uint sg = simdgroup_index_in_threadgroup;
     const uint ln = thread_index_in_simdgroup;
 
-    threadgroup float qs[DK], ks[DK], vs[DV], outs[DV];
-    threadgroup float part_b[32], part_a[32];
-    threadgroup float qn, kn, gg, bb, on;
+    threadgroup float qs[T * DK], ks[T * DK], vs[T * DV], outs[T * DV];
+    threadgroup float part_b[32 * T], part_a[32 * T];
+    threadgroup float gg[T], bb[T], qn[T], kn[T], on[T];
 
-    // 0. this head's b and a: dot products of x with two fp32 rows (in_proj_b, in_proj_a)
-    {
+    // 0. gate coefficients for every token: b = <x_t, in_proj_b[h]>, a = <x_t, in_proj_a[h]>
+    for (int tt = 0; tt < T; tt++) {
         float pb = 0.0f, pa = 0.0f;
         for (uint i = t; i < HID; i += 1024) {
-            float xv = float(x[i]);
+            const float xv = float(x[tt * HID + i]);
             pb += xv * abw[h * HID + i];
             pa += xv * abw[(HV + h) * HID + i];
         }
         pb = simd_sum(pb); pa = simd_sum(pa);
-        if (ln == 0) { part_b[sg] = pb; part_a[sg] = pa; }
+        if (ln == 0) { part_b[sg * T + tt] = pb; part_a[sg * T + tt] = pa; }
     }
-
-    // 1. depthwise conv + silu for this head's q, k and v channels
+    // conv state shift: rows T..T+TAPS-2 of [cstate; mixed]. v channels belong to this
+    // head; the q/k channels are shared per k group, so the first 2*KD/DV heads copy them.
+    {
+        const int cv = 2 * KD + h * DV;
+        for (int tap = 0; tap < TAPS - 1; tap++) {
+            const int j = T + tap;
+            if (t < DV) {
+                cstate_out[tap * CD + cv + t] = j < TAPS - 1 ? cstate[j * CD + cv + t] : mixed[(j - (TAPS - 1)) * CD + cv + t];
+            }
+            if (h < (2 * KD) / DV && t >= DV && t < 2 * DV) {
+                const int c = h * DV + (t - DV);
+                cstate_out[tap * CD + c] = j < TAPS - 1 ? cstate[j * CD + c] : mixed[(j - (TAPS - 1)) * CD + c];
+            }
+        }
+    }
+    // 1. depthwise conv + silu for every token over the window rows tt .. tt+TAPS-1
     if (t < DK + DK + DV) {
-        int which = t < DK ? 0 : (t < 2 * DK ? 1 : 2);
-        int i = which == 0 ? t : (which == 1 ? t - DK : t - 2 * DK);
-        int c = which == 0 ? hk * DK + i : (which == 1 ? KD + hk * DK + i : 2 * KD + h * DV + i);
-        float acc = 0.0f;
-        for (int tap = 0; tap < TAPS - 1; tap++)
-            acc += float(cstate[tap * CD + c]) * cw[tap * CD + c];
-        acc += float(mixed[c]) * cw[(TAPS - 1) * CD + c];
-        float sv = acc / (1.0f + exp(-acc));
-        if (which == 0) qs[i] = sv; else if (which == 1) ks[i] = sv; else vs[i] = sv;
-    }
-    // conv state shift. v channels belong to this head; the q/k channels (2*KD of them)
-    // are shared between the heads of a k group, so the first 2*KD/DV heads copy them.
-    {
-        int cv = 2 * KD + h * DV;
-        if (t < DV) {
-            for (int tap = 0; tap < TAPS - 2; tap++)
-                cstate_out[tap * CD + cv + t] = cstate[(tap + 1) * CD + cv + t];
-            cstate_out[(TAPS - 2) * CD + cv + t] = mixed[cv + t];
-        }
-        if (h < (2 * KD) / DV && t >= DV && t < 2 * DV) {
-            int c = h * DV + (t - DV);
-            for (int tap = 0; tap < TAPS - 2; tap++)
-                cstate_out[tap * CD + c] = cstate[(tap + 1) * CD + c];
-            cstate_out[(TAPS - 2) * CD + c] = mixed[c];
+        const int which = t < DK ? 0 : (t < 2 * DK ? 1 : 2);
+        const int i = which == 0 ? t : (which == 1 ? t - DK : t - 2 * DK);
+        const int c = which == 0 ? hk * DK + i : (which == 1 ? KD + hk * DK + i : 2 * KD + h * DV + i);
+        float w4[TAPS];
+        for (int tap = 0; tap < TAPS; tap++) w4[tap] = cw[tap * CD + c];
+        for (int tt = 0; tt < T; tt++) {
+            float acc = 0.0f;
+            for (int tap = 0; tap < TAPS; tap++) {
+                const int j = tt + tap;
+                const float v = j < TAPS - 1 ? float(cstate[j * CD + c]) : float(mixed[(j - (TAPS - 1)) * CD + c]);
+                acc += v * w4[tap];
+            }
+            const float sv = acc / (1.0f + exp(-acc));
+            if (which == 0) qs[tt * DK + i] = sv; else if (which == 1) ks[tt * DK + i] = sv; else vs[tt * DV + i] = sv;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 2. rms scales for q and k (no weight), gate g and beta
+    // 2. gate reduce, rms scales for q and k, per token
     if (sg == 0) {
-        float sq = 0.0f, sk = 0.0f;
-        for (int i = 0; i < DK / 32; i++) {
-            float a = qs[ln * (DK / 32) + i], b = ks[ln * (DK / 32) + i];
-            sq += a * a; sk += b * b;
-        }
-        sq = simd_sum(sq); sk = simd_sum(sk);
-        if (ln == 0) {
-            const float inv_scale = rsqrt(float(DK));
-            qn = rsqrt(sq / float(DK) + 1e-6f) * inv_scale * inv_scale;
-            kn = rsqrt(sk / float(DK) + 1e-6f) * inv_scale;
-        }
-        float pb = simd_sum(part_b[ln]), pa = simd_sum(part_a[ln]);
-        if (ln == 0) {
-            float a_ = pa + dtb[h];
-            float sp = a_ > 20.0f ? a_ : log1p(exp(a_));
-            gg = exp(-exp(alog[h]) * sp);
-            bb = 1.0f / (1.0f + exp(-pb));
+        for (int tt = 0; tt < T; tt++) {
+            const float pb = simd_sum(part_b[ln * T + tt]), pa = simd_sum(part_a[ln * T + tt]);
+            float sq = 0.0f, sk = 0.0f;
+            for (int i = 0; i < DK / 32; i++) {
+                const float a = qs[tt * DK + ln * (DK / 32) + i], b = ks[tt * DK + ln * (DK / 32) + i];
+                sq += a * a; sk += b * b;
+            }
+            sq = simd_sum(sq); sk = simd_sum(sk);
+            if (ln == 0) {
+                const float a_ = pa + dtb[h];
+                const float sp = a_ > 20.0f ? a_ : log1p(exp(a_));
+                gg[tt] = exp(-exp(alog[h]) * sp);
+                bb[tt] = 1.0f / (1.0f + exp(-pb));
+                const float inv_scale = rsqrt(float(DK));
+                qn[tt] = rsqrt(sq / float(DK) + 1e-6f) * inv_scale * inv_scale;
+                kn[tt] = rsqrt(sk / float(DK) + 1e-6f) * inv_scale;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 3. delta rule. thread t owns state[h, dv, c0 .. c0+CH) with dv = t/8, c0 = (t%8)*CH
+    // 3. delta rule over the tokens, state in registers, no barriers
+    const int dv = t >> 3, c0 = (t & 7) * CH;
+    float st[CH];
     {
-        constexpr int CH = DK / 8;
-        const int dv = t >> 3, c0 = (t & 7) * CH;
         const device float* sp = state + (h * DV + dv) * DK + c0;
-        device float* so = state_out + (h * DV + dv) * DK + c0;
-        float st[CH], kk[CH];
+        for (int i = 0; i < CH; i++) st[i] = sp[i];
+    }
+    for (int tt = 0; tt < T; tt++) {
+        const float g_ = gg[tt], b_ = bb[tt], kn_ = kn[tt], qn_ = qn[tt];
+        const threadgroup float* kt = ks + tt * DK + c0;
+        const threadgroup float* qt = qs + tt * DK + c0;
         float kv = 0.0f;
         for (int i = 0; i < CH; i++) {
-            st[i] = sp[i] * gg;
-            kk[i] = ks[c0 + i] * kn;
-            kv += st[i] * kk[i];
+            st[i] *= g_;
+            kv += st[i] * kt[i];
         }
+        kv *= kn_;
         kv += simd_shuffle_xor(kv, 1); kv += simd_shuffle_xor(kv, 2); kv += simd_shuffle_xor(kv, 4);
-        const float delta = (vs[dv] - kv) * bb;
+        const float delta = (vs[tt * DV + dv] - kv) * b_ * kn_;
         float o = 0.0f;
         for (int i = 0; i < CH; i++) {
-            st[i] += kk[i] * delta;
-            o += st[i] * qs[c0 + i] * qn;
-            so[i] = st[i];
+            st[i] += kt[i] * delta;
+            o += st[i] * qt[i];
         }
+        o *= qn_;
         o += simd_shuffle_xor(o, 1); o += simd_shuffle_xor(o, 2); o += simd_shuffle_xor(o, 4);
-        if ((t & 7) == 0) outs[dv] = o;
+        if ((t & 7) == 0) outs[tt * DV + dv] = o;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 4. gated RMSNorm: rms over the head's DV outputs, weight nw, gate silu(z)
+    // 4. gated RMSNorm scale per token
     if (sg == 0) {
-        float ss = 0.0f;
-        for (int i = 0; i < DV / 32; i++) { float a = outs[ln * (DV / 32) + i]; ss += a * a; }
-        ss = simd_sum(ss);
-        if (ln == 0) on = rsqrt(ss / float(DV) + eps[0]);
+        for (int tt = 0; tt < T; tt++) {
+            float ss = 0.0f;
+            for (int i = 0; i < DV / 32; i++) { const float a = outs[tt * DV + ln * (DV / 32) + i]; ss += a * a; }
+            ss = simd_sum(ss);
+            if (ln == 0) on[tt] = rsqrt(ss / float(DV) + eps[0]);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (t < DV) {
-        float xo = outs[t] * on * nw[t];
-        float zz = float(z[h * DV + t]);
-        y[h * DV + t] = half(zz / (1.0f + exp(-zz)) * xo);
+        for (int tt = 0; tt < T; tt++) {
+            const float xo = outs[tt * DV + t] * on[tt] * nw[t];
+            const float zz = float(z[tt * HV * DV + h * DV + t]);
+            y[tt * HV * DV + h * DV + t] = half(zz / (1.0f + exp(-zz)) * xo);
+        }
+    }
+    {
+        device float* so = state_out + (h * DV + dv) * DK + c0;
+        for (int i = 0; i < CH; i++) so[i] = st[i];
     }
 """
 
@@ -194,9 +210,13 @@ def _prepare(m):
     return m._fused_consts[1:]
 
 
+RECORD = False   # when True, gdn_decode keeps its inputs on the module for rollback()
+
+
 def gdn_decode(m, x, cache):
-    """One decode step of a ``Qwen3_5GatedDeltaNet`` layer: x is (1, 1, hidden)."""
+    """Decode T (1..8) tokens of a ``Qwen3_5GatedDeltaNet`` layer: x is (1, T, hidden)."""
     cw, alog, dtb, nw, ab_w, eps = _prepare(m)
+    T = x.shape[1]
     mixed = m.in_proj_qkv(x)
     z = m.in_proj_z(x)
     HV, HK, DK, DV = m.num_v_heads, m.num_k_heads, m.head_k_dim, m.head_v_dim
@@ -204,19 +224,56 @@ def gdn_decode(m, x, cache):
     state = cache[1]
     if state is None:
         state = mx.zeros((1, HV, DV, DK), dtype=mx.float32)
-    y, cstate_out, state_out = _get_kernel()(
-        inputs=[x, ab_w, mixed, z, cstate, cw, alog, dtb, state, nw, eps],
-        template=[("HV", HV), ("HK", HK), ("DK", DK), ("DV", DV), ("HID", x.shape[-1])],
-        grid=(1024 * HV, 1, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(1, 1, HV * DV), cstate.shape, (1, HV, DV, DK)],
-        output_dtypes=[mixed.dtype, cstate.dtype, mx.float32],
-    )
+    y, cstate_out, state_out = _run_kernel(m, x, mixed, z, cstate, state, T, cw, alog, dtb, nw, ab_w, eps)
+    if RECORD:
+        m._fused_last = (x, mixed, z, cstate, state, T)
     cache[0] = cstate_out
     cache[1] = state_out
     if hasattr(cache, "advance"):
-        cache.advance(1)
+        cache.advance(T)
     return m.out_proj(y)
+
+
+def _run_kernel(m, x, mixed, z, cstate, state, T, cw, alog, dtb, nw, ab_w, eps):
+    HV, HK, DK, DV = m.num_v_heads, m.num_k_heads, m.head_k_dim, m.head_v_dim
+    return _get_kernel()(
+        inputs=[x, ab_w, mixed, z, cstate, cw, alog, dtb, state, nw, eps],
+        template=[("HV", HV), ("HK", HK), ("DK", DK), ("DV", DV), ("HID", x.shape[-1]), ("T", T)],
+        grid=(1024 * HV, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, T, HV * DV), cstate.shape, (1, HV, DV, DK)],
+        output_dtypes=[mixed.dtype, cstate.dtype, mx.float32],
+    )
+
+
+def rollback(model, cache, fed: int, keep: int) -> None:
+    """After a recorded forward of ``fed`` tokens, leave the caches as if only the first
+    ``keep`` of them had been fed.
+
+    Linear-attention layers are replayed from their recorded inputs and pre-forward
+    state through the same kernel with T=keep (the state never leaves the kernel, so
+    there is nothing to snapshot per position); attention caches are trimmed.
+    """
+    language_model = getattr(model, "language_model", model)
+    for layer, c in zip(language_model.model.layers, cache):
+        m = getattr(layer, "linear_attn", None)
+        if m is None:
+            if fed > keep and c is not None and c.is_trimmable():
+                c.trim(fed - keep)
+            continue
+        rec = getattr(m, "_fused_last", None)
+        if rec is None:
+            continue
+        x, mixed, z, cstate, state, T = rec
+        if keep >= T:
+            continue
+        cw, alog, dtb, nw, ab_w, eps = _prepare(m)
+        _, cstate_out, state_out = _run_kernel(m, x[:, :keep], mixed[:, :keep], z[:, :keep],
+                                               cstate, state, keep, cw, alog, dtb, nw, ab_w, eps)
+        c[0] = cstate_out
+        c[1] = state_out
+        if hasattr(c, "advance"):
+            c.advance(keep - T)
 
 
 def _fast_path_ok(m, inputs, mask, cache, kwargs):
@@ -229,7 +286,7 @@ def _fast_path_ok(m, inputs, mask, cache, kwargs):
         and kwargs.get("gdn_sink") is None
         and inputs.ndim == 3
         and inputs.shape[0] == 1
-        and inputs.shape[1] == 1
+        and 1 <= inputs.shape[1] <= 8
         and cache[0].shape[0] == 1
         and cache[0].shape[1] == m.conv_kernel_size - 1
         and cache[1].shape[0] == 1

@@ -21,7 +21,7 @@ import mlx.core as mx
 
 from bonsai_abliterate.pack import eos_ids, load_pack, load_tokenizer, render_chat
 from bonsai_abliterate.ablation import install, load_direction
-from bonsai_abliterate import fused
+from bonsai_abliterate import fused, mma, dflash, spec
 
 DEFAULT_DIRECTION = Path(__file__).resolve().parent / "directions" / "refusal_dir.safetensors"
 
@@ -45,6 +45,13 @@ def parse_args(argv=None):
                    help="let the model reason at length before answering")
     p.add_argument("--layers", default="",
                    help="comma-separated layer indices to ablate; empty means all")
+    p.add_argument("--draft", default="",
+                   help="directory holding a DFlash 2 drafter (dflash/config.json and "
+                        "dflash/model.safetensors); enables speculative decoding for greedy runs")
+    p.add_argument("--spec-min-gain", type=float, default=3.5,
+                   help="fall back to plain decoding for the rest of a reply once ten or more "
+                        "rounds have averaged fewer tokens than this per round (a round costs "
+                        "about 3.7 plain steps on an M1 Ultra)")
     p.add_argument("--no-fused", action="store_true",
                    help="run the pack runtime's own per-op decode path instead of the fused "
                         "linear-attention kernel (slower; useful for A/B checks)")
@@ -121,6 +128,64 @@ def generate(language_model, tok, ids, stops, max_new, temp, top_p, stream=True,
     return tok.decode(produced), elapsed, len(produced), truncated, consumed
 
 
+def generate_spec(speculator, tok, ids, stops, max_new, cache, start_pos, stream=True):
+    """Speculative counterpart of generate(): same return tuple.
+
+    ``ids`` are the tokens the cache has not seen; ``start_pos`` how many it has. Falls
+    back to plain decoding for the rest of the reply when rounds stop paying, and to
+    finish, feeds the last pending token so the cache holds every token of the reply
+    (the same invariant generate() keeps), except a stop token, which stays unconsumed.
+    """
+    lm = speculator.lm
+    t0 = time.time()
+    speculator.begin_turn()
+    pending = int(mx.argmax(speculator.prefill(ids, cache, start_pos)).item())
+    produced, consumed = [], list(ids)
+    truncated, stopped = True, False
+    if pending in stops:
+        stopped, truncated = True, False
+    else:
+        # the first token comes from the prefill; every later one from a round
+        produced.append(pending)
+        if stream:
+            sys.stdout.write(tok.decode([pending]))
+            sys.stdout.flush()
+    while not stopped and len(produced) < max_new:
+        if speculator.should_give_up():
+            break
+        committed, used, stopped = speculator.round(pending, cache, max_new - len(produced))
+        consumed += used
+        for t in committed:
+            if t in stops:
+                break
+            produced.append(t)
+            if stream:
+                sys.stdout.write(tok.decode([t]))
+                sys.stdout.flush()
+        if stopped:
+            truncated = False
+            break
+        pending = committed[-1]
+    # ``pending`` is already in ``produced`` (it was the last committed token, or the
+    # prefill's token) but the cache has not seen it yet.
+    if not stopped and len(produced) < max_new:
+        # rounds stopped paying: plain decoding from the pending token onwards. The
+        # drafter misses the rows for these tokens, so its context is rebuilt next turn.
+        speculator.stale = True
+        _, _, _, truncated, rest = generate(lm, tok, [pending], stops, max_new - len(produced),
+                                            0.0, 1.0, stream=stream, cache=cache)
+        consumed += rest                      # [pending] + the plain reply (+ stop token)
+        produced += [t for t in rest[1:] if t not in stops]
+        return tok.decode(produced), time.time() - t0, len(produced), truncated, consumed
+    if not stopped and pending not in stops:
+        # budget reached: feed the pending token so the cache holds every reply token
+        speculator.consume(pending, cache)
+        consumed.append(pending)
+    if stream:
+        sys.stdout.write("\n")
+    return tok.decode(produced), time.time() - t0, len(produced), truncated, consumed
+
+
 def main(argv=None):
     args = parse_args(argv)
     if not args.prompts and not args.interactive:
@@ -148,6 +213,16 @@ def main(argv=None):
         log(f"[fused] {fused.install(model)} linear-attention layers decode through one kernel")
 
     language_model = model.language_model
+
+    speculator = None
+    if args.draft:
+        if args.temp > 0:
+            log("[spec] sampling requested; speculative decoding is greedy-only, disabled")
+        else:
+            drafter = dflash.load_drafter(args.draft, model)
+            mma.install()
+            speculator = spec.Speculator(model, drafter, stops, min_gain=args.spec_min_gain)
+            log(f"[spec] drafter loaded: block {speculator.bs}, taps {speculator.tap}")
 
     history: list[dict] = []
     # The cache carried between turns, and the token ids it has already consumed.
@@ -192,10 +267,18 @@ def main(argv=None):
             session["ids"] = []
             log(f"\n>>> {prompt}\n[{len(new_ids)} prompt tokens]")
 
-        reply, elapsed, n, truncated, consumed = generate(
-            language_model, tok, new_ids, stops, args.max_new, args.temp, args.top_p,
-            cache=cache)
-        log(f"[{n} tokens in {elapsed:.1f}s = {n/max(elapsed,1e-9):.2f} tok/s]")
+        if speculator is not None:
+            if cache is None or not session["ids"]:
+                speculator.reset()
+            reply, elapsed, n, truncated, consumed = generate_spec(
+                speculator, tok, new_ids, stops, args.max_new, cache, len(session["ids"]))
+            log(f"[{n} tokens in {elapsed:.1f}s = {n/max(elapsed,1e-9):.2f} tok/s; "
+                f"spec: {speculator.stats()}]")
+        else:
+            reply, elapsed, n, truncated, consumed = generate(
+                language_model, tok, new_ids, stops, args.max_new, args.temp, args.top_p,
+                cache=cache)
+            log(f"[{n} tokens in {elapsed:.1f}s = {n/max(elapsed,1e-9):.2f} tok/s]")
         if truncated:
             # Always shown, even with --quiet: the cut-off reply is otherwise
             # indistinguishable from the model stopping on its own.
