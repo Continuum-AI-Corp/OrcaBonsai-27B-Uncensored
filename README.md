@@ -1,6 +1,6 @@
 # OrcaRouter Ternary Bonsai 2 27B Uncensored
 
-**Runtime-uncensored Ternary Bonsai 2 27B — without modifying or re-quantizing the original weights.**
+**Runtime-uncensored Ternary Bonsai 2 27B — without modifying or re-quantizing the original weights by **[`OrcaRouter research team`](https://www.orcarouter.ai)**.**
 
 This repository applies refusal-direction ablation to [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) entirely **at runtime**.
 
@@ -696,7 +696,7 @@ Built on:
 
 **Ternary Bonsai 2 27B** by `prism-ml`
 
-Runtime refusal-direction implementation and tooling by **OrcaRouter**.
+Runtime refusal-direction implementation and tooling by **[`OrcaRouter`](https://www.orcarouter.ai)**.
 
 The original model pack is not redistributed or modified by this repository.
 
