@@ -226,6 +226,18 @@ two cost; a two-launch fp16 Hadamard gained nothing and lost precision. The step
 mostly the serial sum of the matmuls' own times (~32 ms of the 35), which is the
 kernel-level limit discussed below.
 
+**Speculative decoding** is not wired in, and the measurement that decides whether it
+can be is in `scripts/proto_tern_mma.py`. MLX's quantized matmul costs almost linearly
+in the number of tokens in flight up to 8 on this pack (verifying 5 draft tokens costs
+3.2 plain steps), which is why community ports report only 1.07–1.13x on Bonsai. A
+matmul on `simdgroup_matrix` tiles is flat in M and verifies 8 tokens for 2.55x the
+matmul cost of a plain step, but on an M1 Ultra those tiles run on the ordinary FP32
+ALUs (3.48 TMAC/s measured), so it is 2.7x slower than the stock kernel at M=1 and only
+pays from M=4 on. Net: with the published DFlash2 drafter, code-like workloads (94%
+acceptance) would decode around 2x faster and chat-like ones slower, so an integration
+has to pick the path per step. Chips with matrix hardware in the GPU (M5 family) change
+this arithmetic.
+
 `scripts/bench_decode.py` reports where a decode step's time goes on your machine: the
 step with and without the ablation, the 401 quantized matmuls alone and what the
 Hadamard transform costs, the split by block type, and how cost grows with the number
