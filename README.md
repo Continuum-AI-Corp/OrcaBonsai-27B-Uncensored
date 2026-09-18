@@ -650,18 +650,24 @@ removed and how to rebuild it.
 # GGUF / llama.cpp
 
 The same edit ships as a rank-1 LoRA adapter, so the published ternary GGUF stays
-byte-identical and the adapter is 9.7 MB.
+byte-identical. The adapter is in this repo — nothing to build:
 
-```bash
-python scripts/export_gguf_lora.py \
-    --checkpoint /path/to/Bonsai-2-27B-unfolded-fp16 \
-    --base-gguf  /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-    --out        bonsai-abliterate-lora.gguf
+```text
+gguf/bonsai-abliterate-lora.gguf     9,682,464 bytes
+sha256  f1669534803d340a496015f5c45125f3437b4d13ec764f40e34488ce83967f42
 ```
 
 ```bash
-llama-cli -m Ternary-Bonsai-2-27B-PTQ1_0.gguf --lora bonsai-abliterate-lora.gguf
+llama-cli -m Ternary-Bonsai-2-27B-PTQ1_0.gguf --lora gguf/bonsai-abliterate-lora.gguf
 ```
+
+It holds 129 `lora_a`/`lora_b` pairs — one per residual writer — as F32, against
+`general.architecture = qwen35` and `adapter.lora_alpha = 1.0`.
+
+`scripts/export_gguf_lora.py` rebuilds it, for anyone who wants to check the provenance
+or re-derive it against a different direction. That path needs the unfolded fp16
+checkpoint, which this repo does not ship, so it is for reproduction rather than for
+ordinary use.
 
 `W' = W - r (r^T W)` is rank 1, so the whole edit is `A = r^T W`, `B = -r`. llama.cpp
 builds a LoRA into the graph as two extra matmuls on the activation and never merges it
@@ -725,11 +731,10 @@ so it is genuinely in the compute graph. All 129 sites are on LoRA-aware paths:
 `ffn_down` through `build_ffn`'s `build_lora_mm`, `attn_output` and `ssm_out` inline in
 `qwen35.cpp`, `token_embd` in `build_inp_embd`.
 
-Two things are not. **PQ2_0 was not run** — the adapter does not depend on the base's
-quantization, and all three published GGUFs carry the same 851 tensor names, so the same
-file should apply, but only PTQ1_0 was tested. And the exporter needs the **unfolded fp16
-checkpoint**, which this repo does not ship; without it there is nothing to compute
-`r^T W` against.
+One thing is not: **PQ2_0 was not run.** The adapter does not depend on the base's
+quantization — `A = r^T W` comes from the unfolded checkpoint and the base GGUF is read
+only for tensor names — and all three published GGUFs carry the same 851 names, so the
+same file should apply. Only PTQ1_0 was actually tested.
 
 A LoRA on a tensor llama.cpp does not route through `build_lora_mm` loads without error
 and does nothing at all. Check that scale 0 reproduces the published model and that a
