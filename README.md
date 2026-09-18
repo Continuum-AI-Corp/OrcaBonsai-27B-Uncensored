@@ -508,6 +508,76 @@ Per residual write it adds approximately:
 
 No alternative model weights need to be stored.
 
+## iPhone memory budget
+
+On a phone the binding constraint is resident memory, and it is almost entirely the
+weights. Measured on the pack, not estimated:
+
+```text
+ternary codes              6.256 GiB   78.2%
+vision tower               0.858 GiB   10.7%
+group biases (redundant)   0.391 GiB    4.9%
+group scales               0.391 GiB    4.9%
+norms + GDN state path     0.098 GiB    1.2%
+hadamard signs             0.011 GiB    0.1%
+total                      8.005 GiB
+```
+
+The KV cache is not the problem here, which is what makes a 27B model on a phone worth
+discussing at all. Only 16 of the 64 layers use full attention:
+
+```text
+16 full-attention layers    64 KiB per token  (256 MiB at 4K context)
+48 linear-attention layers  72 MiB of recurrent state, fixed, context-independent
+```
+
+Two things can come out of the pack for a text-only app:
+
+```bash
+python scripts/prepare_ios_pack.py \
+    --pack /path/to/Ternary-Bonsai-2-27B-mlx-2bit \
+    --out  /path/to/Bonsai-2-27B-ios
+```
+
+```text
+source pack                 8.005 GiB
+  - vision tower           -0.858        memory and disk
+  - redundant biases       -0.391        disk; memory only with a kernel that reconstructs
+result                      6.756 GiB
+```
+
+The distinction between those two lines matters. The vision tower is a genuine memory
+saving: it is only read when an image is in the prompt, and the pack documents it as the
+stock unquantized Qwen tower.
+
+The biases are a *download* saving. The affine container stores a scale and a bias per
+group of 128, but the ternary levels `{-s, 0, +s}` come out of `scale = s`, `bias = -s`,
+so the bias holds no information — verified exact across all 402 packed modules, every
+group, `max |bias + scale| = 0`. MLX's `quantized_matmul` and `dequantize` still take a
+bias argument, so a runtime that calls them has to materialise `-scales` at load and
+saves no memory at all. The memory saving needs a kernel that assumes the identity.
+Check before counting on it.
+
+Nothing in that script touches the ternary codes, the group scales, the Hadamard signs
+or the direction. Kept tensors are bit-identical to the source.
+
+Whether 6.756 GiB fits is a per-device question this repo cannot answer for you: iOS
+caps a single app well below total RAM, and the cap depends on the device and on whether
+`com.apple.developer.kernel.increased-memory-limit` has been granted. Do the arithmetic
+against your own target before committing to it. An 8 GB device does not have room for
+6.756 GiB of weights plus an app.
+
+Decode is memory-bandwidth-bound: every token reads the whole weight set. The ~47 tok/s
+figure quoted for an M5 Max laptop corresponds to several hundred GB/s of usable
+bandwidth; a phone has a fraction of that, so expect a fraction of the throughput, and
+expect sustained generation to meet thermal limits.
+
+The output pack is meant for an app with its own model integration. It is deliberately
+not loadable by the pack's bundled Python loaders — `vision_artifact.load_vl_model`
+requires `components.vision`, and a removed bias changes what a `Packed` module reads.
+Keep the original pack for anything that uses those; `ios-pack.json` records what was
+removed and how to rebuild it.
+
 ---
 
 # Running on x86 Linux
