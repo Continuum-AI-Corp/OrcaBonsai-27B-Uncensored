@@ -74,6 +74,7 @@ whole block of mask positions in a single parallel (block-diffusion) pass.
 """
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
@@ -213,15 +214,8 @@ class DFlashGroupedConv(nn.Module):
 
     def _convolve(self, x, delta, side: int):
         # x [B, L, H]; delta [B, L, taps, num_groups]
-        B, L, H = x.shape
-        xg = x.reshape(B, L, self.num_groups, self.group_size)
-        coeff = (self.base_kernel[side].reshape(1, 1, self.taps, self.num_groups, self.group_size)
-                 + delta[..., None])
-        out = coeff[:, :, 0] * xg
-        for t in range(1, self.taps):
-            shifted = mx.pad(xg[:, :-t], ((0, 0), (t, 0), (0, 0), (0, 0)))
-            out = out + coeff[:, :, t] * shifted
-        return out.reshape(B, L, H)
+        # bonsai: compiled so the pads, broadcasts and multiply-adds become one graph
+        return _convolve_compiled(x, delta, self.base_kernel[side], self.taps, self.group_size)
 
     def prepare(self, x):
         coeff = self.kernel_projection(x).reshape(*x.shape[:-1], 2, self.taps, self.num_groups)
@@ -229,6 +223,19 @@ class DFlashGroupedConv(nn.Module):
 
     def finish(self, y, delta):
         return self._convolve(y, delta, 1)
+
+
+@partial(mx.compile, shapeless=False)
+def _convolve_compiled(x, delta, base, taps, group_size):
+    B, L, H = x.shape
+    num_groups = H // group_size
+    xg = x.reshape(B, L, num_groups, group_size)
+    coeff = base.reshape(1, 1, taps, num_groups, group_size) + delta[..., None]
+    out = coeff[:, :, 0] * xg
+    for t in range(1, taps):
+        shifted = mx.pad(xg[:, :-t], ((0, 0), (t, 0), (0, 0), (0, 0)))
+        out = out + coeff[:, :, t] * shifted
+    return out.reshape(B, L, H)
 
 
 class CandidateSelector(nn.Module):
