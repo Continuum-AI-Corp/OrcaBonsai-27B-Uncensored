@@ -210,13 +210,19 @@ Measured on an M1 Ultra, greedy, 300-token reply, ablation on:
 
 ```text
 pack runtime path      25.2 tok/s
-fused (default)        28.3 tok/s     python run.py ... (--no-fused restores the old path)
+fused (default)        29.1 tok/s   (28.3 before the command-buffer change below)     python run.py ... (--no-fused restores the old path)
 ```
 
 The 300 tokens are identical between the two paths on the prompt used; the fused kernel
 keeps float32 where the runtime rounds to fp16 between ops, so the per-layer output
 differs from the runtime's by ~4e-4 relative (measured across all 48 layers) and the
 recurrent state by ~1e-7. `selfcheck.py` passes unchanged.
+
+`run.py` also raises MLX's Metal command-buffer limits (`MLX_MAX_OPS_PER_BUFFER` and
+`MLX_MAX_MB_PER_BUFFER`, 50 and 50 MB by default on Ultra chips) to 2000: a decode step
+is ~1,500 dispatches over 7.2 GB of weights and every buffer boundary idles the GPU for
+~20 µs. Plain decoding measured 27.3 → 29.1 tok/s with the change; speculative rounds,
+which are bound by the tile matmuls, did not move. An explicit environment value wins.
 
 What did not help, so nobody repeats it: a single-launch Walsh-Hadamard kernel was
 slower than the runtime's four launches; stacking q/k/v, gate/up and qkv/z into one

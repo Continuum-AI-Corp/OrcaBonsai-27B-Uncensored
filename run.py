@@ -10,12 +10,23 @@ projection is applied at run time rather than baked into the weights.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# MLX commits a Metal command buffer every 50 dispatches or 50 MB of distinct weight
+# buffers on Ultra-class chips, and each boundary costs ~20 us of GPU idle plus a CPU
+# completion handler. A decode step here is ~1,500 dispatches over 7.2 GB of weights,
+# so the defaults cut it into well over a hundred buffers. Raising the limits measured
+# 27.3 -> 29.1 tok/s on plain decoding on an M1 Ultra (mlx issue 4521 reports 5-8% on
+# an M3 Ultra). Must be set before mlx is imported; an explicit value in the
+# environment wins.
+os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "2000")
+os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "2000")
 
 import mlx.core as mx
 
