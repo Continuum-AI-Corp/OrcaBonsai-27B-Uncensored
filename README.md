@@ -131,6 +131,17 @@ python run.py \
   "your prompt"
 ```
 
+`--pack` is the directory holding `config.json` and `runtime/`. If you downloaded with
+`huggingface_hub`, that is the **snapshot** directory, not the `models--...` cache entry
+above it:
+
+```bash
+python -c "from huggingface_hub import snapshot_download; \
+print(snapshot_download('prism-ml/Ternary-Bonsai-2-27B-mlx-2bit'))"
+```
+
+A cache entry is accepted too and its newest snapshot is resolved for you.
+
 By default:
 
 ```text
