@@ -197,6 +197,35 @@ Expected:
 129 residual writers
 ```
 
+## Decode speed
+
+`run.py` decodes each linear-attention layer through one fused Metal kernel
+(`bonsai_abliterate/fused.py`): the depthwise conv and its state shift, silu, the split
+into heads, the q/k RMSNorms, the gate coefficients, the delta-rule recurrence and the
+gated RMSNorm, which the pack runtime runs as a dozen separate launches per layer. The
+ablation projection is likewise one launch per site instead of six. Weights are
+untouched; the kernel reads the same arrays the runtime reads.
+
+Measured on an M1 Ultra, greedy, 300-token reply, ablation on:
+
+```text
+pack runtime path      25.2 tok/s
+fused (default)        28.3 tok/s     python run.py ... (--no-fused restores the old path)
+```
+
+The 300 tokens are identical between the two paths on the prompt used; the fused kernel
+keeps float32 where the runtime rounds to fp16 between ops, so the per-layer output
+differs from the runtime's by ~4e-4 relative (measured across all 48 layers) and the
+recurrent state by ~1e-7. `selfcheck.py` passes unchanged.
+
+What did not help, so nobody repeats it: a single-launch Walsh-Hadamard kernel was
+slower than the runtime's four launches; stacking q/k/v, gate/up and qkv/z into one
+matmul each (401 launches to 257) left the MLP chain at 18.4 vs 18.7 ms, because at
+these sizes the 2-bit matmul kernel is throughput-bound and one tall matmul costs what
+two cost; a two-launch fp16 Hadamard gained nothing and lost precision. The step is now
+mostly the serial sum of the matmuls' own times (~32 ms of the 35), which is the
+kernel-level limit discussed below.
+
 `scripts/bench_decode.py` reports where a decode step's time goes on your machine: the
 step with and without the ablation, the 401 quantized matmuls alone and what the
 Hadamard transform costs, the split by block type, and how cost grows with the number

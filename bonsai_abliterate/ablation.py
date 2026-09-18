@@ -43,6 +43,67 @@ RESIDUAL_WRITERS = ("mlp.down_proj", "self_attn.o_proj", "linear_attn.out_proj")
 EMBEDDING_PATH = "model.embed_tokens"
 
 
+_PROJECT_SOURCE = r"""
+    // One threadgroup per row of y: dot with the direction in float32, then subtract.
+    // 1024 threads, each owning ceil(D/1024) strided elements.
+    threadgroup float partial[32];
+    const uint row = threadgroup_position_in_grid.x;
+    const uint t = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint ln = thread_index_in_simdgroup;
+    const device T* yr = y + row * D;
+    device T* outr = out + row * D;
+    float acc = 0.0f;
+    for (uint i = t; i < D; i += 1024) acc += float(yr[i]) * d[i];
+    acc = simd_sum(acc);
+    if (ln == 0) partial[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float v = partial[ln];
+        v = simd_sum(v);
+        if (ln == 0) partial[0] = v * alpha[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float c = partial[0];
+    for (uint i = t; i < D; i += 1024) outr[i] = static_cast<T>(float(yr[i]) - c * d[i]);
+"""
+
+_project_kernel = None
+
+
+def _get_project_kernel():
+    global _project_kernel
+    if _project_kernel is None:
+        _project_kernel = mx.fast.metal_kernel(
+            name="bonsai_project_out",
+            input_names=["y", "d", "alpha"],
+            output_names=["out"],
+            source=_PROJECT_SOURCE,
+            ensure_row_contiguous=True,
+        )
+    return _project_kernel
+
+
+def project_out(y: mx.array, direction: mx.array, alpha: mx.array) -> mx.array:
+    """``y - alpha (y . d) d`` along the last axis, as one Metal launch.
+
+    The same arithmetic as the array-op version below (float32 throughout, cast at the
+    end), in one kernel instead of six: on a launch-bound decode step the six cost
+    ~3 ms per token across the 129 sites, the one costs a third of that.
+    """
+    D = y.shape[-1]
+    rows = y.size // D
+    out = _get_project_kernel()(
+        inputs=[y.reshape(rows, D), direction, alpha],
+        template=[("T", y.dtype), ("D", D)],
+        grid=(rows * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(rows, D)],
+        output_dtypes=[y.dtype],
+    )[0]
+    return out.reshape(y.shape)
+
+
 class Ablated(nn.Module):
     """Wrap a module so its output loses the component along ``direction``.
 
@@ -57,9 +118,12 @@ class Ablated(nn.Module):
         d = direction.astype(mx.float32).reshape(-1)
         self._direction = d / mx.maximum(mx.linalg.norm(d), 1e-12)
         self._alpha = float(alpha)
+        self._alpha_arr = mx.array([float(alpha)], dtype=mx.float32)
 
     def __call__(self, *args, **kwargs):
         y = self.inner(*args, **kwargs)
+        if mx.default_device() == mx.gpu and mx.metal.is_available() and y.dtype in (mx.float16, mx.bfloat16, mx.float32):
+            return project_out(y, self._direction, self._alpha_arr)
         yf = y.astype(mx.float32)
         component = mx.sum(yf * self._direction, axis=-1, keepdims=True)
         return (yf - self._alpha * component * self._direction).astype(y.dtype)

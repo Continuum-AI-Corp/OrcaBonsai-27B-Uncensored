@@ -21,6 +21,7 @@ import mlx.core as mx
 
 from bonsai_abliterate.pack import eos_ids, load_pack, load_tokenizer, render_chat
 from bonsai_abliterate.ablation import install, load_direction
+from bonsai_abliterate import fused
 
 DEFAULT_DIRECTION = Path(__file__).resolve().parent / "directions" / "refusal_dir.safetensors"
 
@@ -44,6 +45,9 @@ def parse_args(argv=None):
                    help="let the model reason at length before answering")
     p.add_argument("--layers", default="",
                    help="comma-separated layer indices to ablate; empty means all")
+    p.add_argument("--no-fused", action="store_true",
+                   help="run the pack runtime's own per-op decode path instead of the fused "
+                        "linear-attention kernel (slower; useful for A/B checks)")
     p.add_argument("--interactive", action="store_true", help="read prompts from stdin in a loop")
     p.add_argument("--quiet", action="store_true", help="print only the replies")
     return p.parse_args(argv)
@@ -139,6 +143,9 @@ def main(argv=None):
         log(f"[ablate] alpha={args.alpha}, {len(wrapped)} residual writers wrapped")
     else:
         log("[ablate] disabled (alpha=0), running the pack unmodified")
+
+    if not args.no_fused:
+        log(f"[fused] {fused.install(model)} linear-attention layers decode through one kernel")
 
     language_model = model.language_model
 
