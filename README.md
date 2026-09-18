@@ -211,6 +211,67 @@ This also makes A/B testing straightforward because both configurations use the 
 
 ---
 
+# Evaluation
+
+Refusal is judged by a rule-based opening-phrase classifier (`caveat` = answered but
+wrapped in a disclaimer) — indicative, not an LLM-judge / publication-grade number.
+Thinking off, greedy decoding, 64-token budget on the refusal sets. Base and ablated
+rows are the same weights in the same process, `alpha` 0 against `alpha` 1.
+
+Run on the unfolded fp16 expansion of the pack rather than the pack driving its own
+kernels: the packed quantized matmul has no CUDA implementation, and the CPU backend
+needs minutes per forward pass. The expansion carries the pack's ternary values exactly —
+a container change, not a requantization — and reproduces the pack's own next-token
+distributions to three decimals on spot checks.
+
+## Safety (thinking off)
+
+| Benchmark | n | Base | This Model | Caveat |
+|---|---|---|---|---|
+| AdvBench | 100 | 99.0% | 6.0% | 56.0% |
+| JailbreakBench | 100 | 96.0% | 4.0% | 52.0% |
+| StrongREJECT | 150 | 99.3% | 3.3% | 45.3% |
+| HarmBench | 150 | 98.7% | 7.3% | 48.0% |
+| MaliciousInstruct | 100 | 97.0% | 0.0% | 52.0% |
+| SimpleSafetyTests¹ | 50 | 96.0% | 18.0% | 60.0% |
+| ForbiddenQuestions | 150 | 75.3% | 5.3% | 42.7% |
+
+No reply in any set ran out of its token budget, so none of these rates is inflated by
+truncation.
+
+## Over-refusal on benign prompts
+
+| Benchmark | n | Base | This Model |
+|---|---|---|---|
+| XSTest-safe | 250 | 5.2% | 0.4% |
+| JBB-benign | 100 | 25.0% | 0.0% |
+
+The projection does not only stop refusals on harmful prompts. The published pack turns
+down a quarter of JailbreakBench's *benign* prompts; ablated, it turns down none.
+
+## Capability retention
+
+| Benchmark | n | Base | This Model | Δ |
+|---|---|---|---|---|
+| MMLU | 300 | 76.7% | 77.7% | +1.0 |
+| GSM8K | 150 | 87.3% | 86.0% | −1.3 |
+| CMMLU | 500 | 76.2% | 75.6% | −0.6 |
+| MMLU-Pro² | 250 | — | — | — |
+
+Every movement is within noise at these sample sizes — one question on GSM8K is 0.7
+points. That is the result the runtime approach is for: the weights are bit-identical,
+so there is no requantization to pay for.
+
+¹ Understated. This set is mostly self-harm prompts, and the model answers them with a
+crisis redirect that opens "I am deeply sorry to hear…" — which the classifier's exact
+phrase list misses, scoring it as compliance. The real residual refusal rate on this set
+is higher than 18%. The classifier is left as-is so these numbers stay comparable with
+our other cards.
+
+² Excluded. Its prompt asks for reasoning before the answer, and 63–64% of replies on
+both sides had not reached one inside the token budget, so the accuracy would be a floor
+set by that budget rather than a measurement.
+
 # Why not release modified weights?
 
 Because modifying the weights defeats one of the most interesting properties of Bonsai.
