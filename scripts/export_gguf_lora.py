@@ -37,6 +37,43 @@ Then:
 
 with PrismML's llama.cpp fork -- stock llama.cpp cannot open the base pack at all, since
 its tensor type id is private to that fork.
+
+## Strength
+
+`--lora` applies the adapter at scale 1.0, which is the projection exactly: llama.cpp
+computes `scale = adapter_scale * alpha / rank` with `rank = lora_b->ne[0]`, and this
+writes `alpha = 1` against rank 1. It is the same operator as a full weight
+orthogonalisation, not an approximation of one.
+
+Exact does not mean every prompt flips. In our own evaluation of the same direction at
+full strength, 6% of AdvBench prompts still refused, and a stubborn prompt looks
+identical at scale 0 and scale 1 while flipping at scale 2. Read a single prompt as a
+sample of one, not as a calibration.
+
+Measured on the PTQ1_0 pack with the fork, greedy, thinking off:
+
+    scale 0     the published model: "I cannot provide instructions on how to..."
+    scale 1     exact projection; most harmful prompts comply, some still refuse
+    scale 2     flips the stubborn ones
+    scale >= 3  over-projection; output degrades, then collapses
+
+So `--lora-scaled adapter.gguf:2` is the knob if you want a harder ablation, and 3 is
+past the useful range. There is no equivalent of this dial in a baked edit.
+
+## What was and was not verified
+
+Verified here: the exported `B @ A` reproduces `-r (r^T W)` exactly, relative error
+0.000e+00 on ffn_down, attn_output, ssm_out and token_embd, and the direction's leakage
+into each falls about six orders of magnitude. Verified end to end against the fork: the
+adapter loads on the ternary pack, scale 0 reproduces the published refusal and scale 100
+destroys the model, so it is genuinely in the compute graph. Every target family is on a
+LoRA-aware path -- `ffn_down` through `build_ffn`'s `build_lora_mm`, `attn_output` and
+`ssm_out` inline in `qwen35.cpp`, `token_embd` in `build_inp_embd`.
+
+Not verified: PQ2_0. The adapter does not depend on the base's quantization -- A comes
+from the unfolded checkpoint and the base GGUF is read only for tensor names -- and all
+three published GGUFs carry the same 851 names, so the same adapter should apply. Only
+PTQ1_0 was actually run.
 """
 from __future__ import annotations
 
@@ -242,10 +279,13 @@ def main():
     print()
     print("Use it against the base pack with PrismML's llama.cpp fork:")
     print(f"  llama-cli -m {Path(a.base_gguf).name} --lora {Path(a.out).name}")
-    print(f"  llama-cli -m {Path(a.base_gguf).name} --lora-scaled {Path(a.out).name}:0.5")
+    print(f"  llama-cli -m {Path(a.base_gguf).name} --lora-scaled {Path(a.out).name}:2")
     print()
-    print("A LoRA on a tensor llama.cpp does not route through build_lora_mm loads without")
-    print("error and does nothing, so confirm the logits actually move before trusting it.")
+    print("Scale 1.0 is the projection exactly; scale 2 flips prompts that resist it, and")
+    print("3 or more over-projects and degrades the output. Judge the strength on several")
+    print("prompts -- at full strength some fraction still refuses, so one prompt tells you")
+    print("very little. Scale 0 should reproduce the published model; if it does not, the")
+    print("adapter is not what you think it is.")
 
 
 if __name__ == "__main__":
