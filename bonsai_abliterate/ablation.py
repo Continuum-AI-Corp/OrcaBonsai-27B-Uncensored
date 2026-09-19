@@ -32,6 +32,7 @@ Two properties of the pack matter when wiring this up:
 """
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -41,6 +42,14 @@ from mlx import nn
 # Suffixes of the modules whose output is added to the residual stream.
 RESIDUAL_WRITERS = ("mlp.down_proj", "self_attn.o_proj", "linear_attn.out_proj")
 EMBEDDING_PATH = "model.embed_tokens"
+
+
+@partial(mx.compile, shapeless=True)
+def _project_direction(y, direction, alpha):
+    """Fuse the correction while keeping its reduction in FP32."""
+    yf = y.astype(mx.float32)
+    component = mx.sum(yf * direction, axis=-1, keepdims=True)
+    return (yf - alpha * component * direction).astype(y.dtype)
 
 
 class Ablated(nn.Module):
@@ -60,9 +69,7 @@ class Ablated(nn.Module):
 
     def __call__(self, *args, **kwargs):
         y = self.inner(*args, **kwargs)
-        yf = y.astype(mx.float32)
-        component = mx.sum(yf * self._direction, axis=-1, keepdims=True)
-        return (yf - self._alpha * component * self._direction).astype(y.dtype)
+        return _project_direction(y, self._direction, self._alpha)
 
 
 def load_direction(path: str | Path) -> tuple[mx.array, dict]:

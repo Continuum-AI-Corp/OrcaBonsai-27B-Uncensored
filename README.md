@@ -107,7 +107,7 @@ Conceptually:
             output
 ```
 
-The projection runs in float32.
+The projection uses an MLX-compiled correction with float32 accumulation, then restores the writer's output dtype. Compilation may change floating-point rounding; it does not change the projection formula or ablation strength.
 
 The original ternary weights are never modified.
 
@@ -184,6 +184,8 @@ Expected:
 ```text
 129 residual writers
 ```
+
+Run `python scripts/test_ablation.py` for a model-free numerical check of the compiled correction, including FP16/FP32 outputs, changing directions, and alpha values 0, 1, and 2.
 
 ---
 
