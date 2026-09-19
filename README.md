@@ -150,6 +150,18 @@ alpha = 1
 
 which enables the full runtime projection.
 
+Quote the prompt: each unquoted word is answered as a separate prompt. For a
+conversation use `--interactive` (`/reset` clears the history, Ctrl-D exits). Each turn
+continues the previous turn's cache rather than re-prefilling the whole history: the
+`[N prompt tokens, M cached, K to prefill]` line says how much was reused. Measured on
+an M1 Ultra, a short question after a 1,246-token reply went from 8.7 s to 1.6 s.
+
+Replies stop at a stop token or at `--max-new` (4096 tokens by default). A reply that
+hits the budget is cut off mid-sentence and a `[cut off at --max-new ...]` line says
+so; raise the budget. `--thinking` spends the same budget on the reasoning first, so
+give it more room. The evaluation numbers below were run with much smaller budgets;
+those are measurement settings, not chat settings.
+
 ---
 ## Evaluation Results
 
@@ -184,6 +196,155 @@ Expected:
 ```text
 129 residual writers
 ```
+
+## Decode speed
+
+`run.py` decodes each linear-attention layer through one fused Metal kernel
+(`bonsai_abliterate/fused.py`): the depthwise conv and its state shift, silu, the split
+into heads, the q/k RMSNorms, the gate coefficients, the delta-rule recurrence and the
+gated RMSNorm, which the pack runtime runs as a dozen separate launches per layer. The
+ablation projection is likewise one launch per site instead of six. Weights are
+untouched; the kernel reads the same arrays the runtime reads.
+
+Measured on an M1 Ultra, greedy, 300-token reply, ablation on:
+
+```text
+pack runtime path      25.2 tok/s
+fused (default)        29.1 tok/s   (28.3 before the command-buffer change below)     python run.py ... (--no-fused restores the old path)
+```
+
+The 300 tokens are identical between the two paths on the prompt used; the fused kernel
+keeps float32 where the runtime rounds to fp16 between ops, so the per-layer output
+differs from the runtime's by ~4e-4 relative (measured across all 48 layers) and the
+recurrent state by ~1e-7. `selfcheck.py` passes unchanged.
+
+`run.py` also raises MLX's Metal command-buffer limits (`MLX_MAX_OPS_PER_BUFFER` and
+`MLX_MAX_MB_PER_BUFFER`, 50 and 50 MB by default on Ultra chips) to 2000: a decode step
+is ~1,500 dispatches over 7.2 GB of weights and every buffer boundary idles the GPU for
+~20 µs. Plain decoding measured 27.3 → 29.1 tok/s with the change; speculative rounds,
+which are bound by the tile matmuls, did not move. An explicit environment value wins.
+
+What did not help, so nobody repeats it: a single-launch Walsh-Hadamard kernel was
+slower than the runtime's four launches; stacking q/k/v, gate/up and qkv/z into one
+matmul each (401 launches to 257) left the MLP chain at 18.4 vs 18.7 ms, because at
+these sizes the 2-bit matmul kernel is throughput-bound and one tall matmul costs what
+two cost; a two-launch fp16 Hadamard gained nothing and lost precision. The step is now
+mostly the serial sum of the matmuls' own times (~32 ms of the 35), which is the
+kernel-level limit discussed below.
+
+## Speculative decoding
+
+`run.py --draft <dir>` decodes with the published DFlash 2 drafter for this model
+([nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX),
+a 4-bit quantisation of Inco AI's `Qwen3.8-27B-DFlash2` head; `<dir>` is the snapshot
+holding `dflash/config.json` and `dflash/model.safetensors`). Greedy only, and the output
+is what plain greedy decoding produces, up to kernel rounding at near-ties: checked
+token-for-token on a 300-token code reply and a three-turn session.
+
+```bash
+python run.py --pack /path/to/pack --draft /path/to/drafter-snapshot --interactive
+```
+
+Each round drafts 7 tokens in one drafter forward (1.9B parameters, conditioned on the
+target's residual stream at layers 5, 19, 33, 47 and 61), verifies them in one target
+forward over 8 tokens, accepts the longest prefix the target agrees with plus its own
+next token, and rolls the caches back to exactly the accepted tokens. Three pieces make
+the verify pass affordable on this pack: `bonsai_abliterate/mma.py` runs the 2-bit
+matmuls on `simdgroup_matrix` tiles for 4–8 rows (flat in the row count, 70 ms for all
+401 against 162 ms with the stock kernel at 8 rows); the fused linear-attention kernel
+handles up to 8 tokens per call with the recurrent state in registers; and rollback
+replays the accepted prefix through that kernel from recorded inputs instead of
+snapshotting per-position states (1.2 GB per round on the runtime's own path).
+
+Two things raise acceptance beyond the published head as-is. The vendored drafter (like
+mlx-dspark and chad) applied a causal mask inside the draft block; DFlash 2 is not causal
+there (`is_causal: false`), and letting the block attend to itself measured +0.3–0.5
+tokens per round on every prompt tried. And a head fine-tuned against the ternary target
+exists: [ProCreations/Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
+(Apache-2.0, GGUF); `scripts/convert_dflash_gguf.py` turns it into a `--draft` directory
+and it accepts about one more token per round on code than the unadapted head, even with
+the ablation on, which it was not trained against.
+
+```text
+tokens accepted per round        unadapted head    causal block     ternary-tuned head
+code (CSV parser function)       4.43              4.97             5.73
+edit (add type hints)            6.47              6.80             7.07
+Chinese essay                    1.50              1.63             1.73
+```
+
+Measured on an M1 Ultra, ablation on, `--max-new 300`, ternary-tuned head:
+
+```text
+                                   plain      --draft
+code (CSV parser function)         29.1       44.6 tok/s   53 rounds, 5.64 tokens/round
+edit (add type hints)              25.4       45.0 tok/s   7.46 tokens/round
+follow-up turn on the same code    27.5       44–47 tok/s
+Chinese essay                      26.8       28.4 tok/s   gave up after 10 rounds at 2.3
+```
+
+A round costs about 3.3 plain steps (draft ~16 ms, verify ~100 ms against a 36 ms
+step), so it pays only when rounds average more than that. What is left in a round is
+spread thin: the drafter's own matmuls are at the same tile-kernel wall as the
+target's, and the attention and MLP glue at 8 rows is a few hundred microseconds per
+layer across a dozen small launches; each remaining item is worth 1–3% and sits below
+the run-to-run noise of a warm M1 Ultra (the same forward drifts 107–121 ms). The drafter's own 4-bit
+linears also go through a tile kernel for 6–8 rows (`mma.install_drafter`), worth 4 ms
+per round; below 6 rows and on its narrow projections the stock kernel is faster. Code and structured text do;
+prose does not. `run.py` therefore watches the reply's mean tokens per round and, once
+ten rounds average below `--spec-min-gain` (3.5), finishes the reply with plain
+decoding; the ten probing rounds cost about 3% on a prose reply. The drafter was trained
+against the bf16 base, not the ternary pack, and the ablation changes the residual
+stream it reads; measured acceptance on code was 4.1–5.6 tokens per round with the
+ablation on, against the 94% (about 6.5 per round) its author reports on the
+unablated bf16 target.
+
+`--lookup` adds copy drafts: when the last four tokens occurred earlier in the
+conversation and a full block followed them, that block is verified instead of running
+the drafter (prompt-lookup decoding). Measured, it does not pay against this drafter:
+
+```text
+                         drafter only          drafter + lookup
+repeat a module verbatim 45.8   7.84/round      46.7   6.97/round (35 of 36 rounds copied)
+rename a class           45.5   7.84/round      42.0   6.44/round
+edit: add type hints     44.8   7.10/round      43.7   6.33/round
+CSV function (no source) 42.0   5.12/round      39.2   4.87/round (4 spurious copies)
+```
+
+Two reasons. The DFlash head already reaches 7.8 of a possible 8 on re-emitted code,
+so a free draft can only save the ~16 ms drafter call, not raise acceptance. And a copy
+from the prompt carries the tokenizer's canonical BPE split, while the target emits its
+own split of the same text (the effect that also rules out re-tokenising history for the
+cache), so identical text is still rejected at token level. Copies of the model's own
+earlier output match exactly, but those are the spans the drafter handles best. Kept as
+an option for drafter-less setups; off by default.
+
+**Integer activations (W2A8), measured but not integrated.** The one way left to make
+the matmuls themselves cheaper on this GPU is to quantise the rotated activations to
+int8 and turn the ternary dot product into AND + popcount over bit-planes. A probe
+kernel (`+1`/`-1` weight bitmasks derived in memory from the pack's codes, 8 activation
+planes per 32 weights, integer sums folded per 128-group) measured, interleaved with
+the stock kernel on a cool GPU: up_proj 1.47x, down_proj 1.66x, qkv 1.30x, o_proj 1.30x,
+so about 1.45x on the step's matmuls, ~20 → ~14 ms. The numerical cost was measured by
+simulating the same int8 rounding on every projection input: over 300-token replies
+the argmax agreed with the fp16 path at 99.7–100% of positions, mean KL 0.0001 nats,
+and the fp16 choice's probability was unchanged to three decimals; greedy text still
+diverges after a few dozen tokens at near-ties. It is not wired in because it changes
+outputs, which this repository promises not to do; the probe is what a decision to
+accept that should start from.
+
+The M1 family has no matrix hardware in the GPU, so the tile matmul is 2.7x slower than
+the stock kernel at one row and is used only for 4–8 rows; on chips with matrix units
+(M5 family) the same kernel would also carry plain decoding and the arithmetic above
+changes.
+
+`scripts/bench_decode.py` reports where a decode step's time goes on your machine: the
+step with and without the ablation, the 401 quantized matmuls alone and what the
+Hadamard transform costs, the split by block type, and how cost grows with the number
+of tokens per step. On an M1 Ultra it shows the pack is not bandwidth-bound: MLX's 2-bit
+matmul kernel is ALU-bound at ~310–370 GB/s while the 4-bit kernel streams 651 GB/s on
+the same GPU, and matmul cost grows almost linearly with tokens per step up to 16, which
+is why speculative decoding does not pay on this pack. Run it before trusting any speed
+estimate for a different machine.
 
 ---
 
@@ -742,10 +903,17 @@ so it is genuinely in the compute graph. All 129 sites are on LoRA-aware paths:
 `ffn_down` through `build_ffn`'s `build_lora_mm`, `attn_output` and `ssm_out` inline in
 `qwen35.cpp`, `token_embd` in `build_inp_embd`.
 
-One thing is not: **PQ2_0 was not run.** The adapter does not depend on the base's
-quantization — `A = r^T W` comes from the unfolded checkpoint and the base GGUF is read
-only for tensor names — and all three published GGUFs carry the same 851 names, so the
-same file should apply. Only PTQ1_0 was actually tested.
+**PQ2_0 is verified too**, on the fork's `prism-b10685` macOS Metal build: the same
+adapter loads on `Ternary-Bonsai-2-27B-PQ2_0.gguf`, scale 0 reproduces the published
+refusal and scale 1 answers the same prompt. That was expected rather than surprising:
+the adapter does not depend on the base's quantization — `A = r^T W` comes from the
+unfolded checkpoint and the base GGUF is read only for tensor names — and all three
+published GGUFs carry the same 851 names.
+
+Speed on an M1 Ultra, greedy, 300-token reply: PTQ1_0 24.9 tok/s base, 23.9 with the
+adapter; PQ2_0 25.4 and 24.5. The MLX path in this repo measures 25.2 with the ablation
+on the same prompt, so on that machine the two routes are interchangeable; the fork's
+prefill is faster (80–87 tok/s at 25 tokens, 180–220 on `llama-bench pp512`).
 
 A LoRA on a tensor llama.cpp does not route through `build_lora_mm` loads without error
 and does nothing at all. Check that scale 0 reproduces the published model and that a

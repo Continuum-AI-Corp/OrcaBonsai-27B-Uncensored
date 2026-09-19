@@ -74,13 +74,17 @@ def load_tokenizer(pack_dir: str | Path):
     ``AutoTokenizer`` resolves classes through ``config.json``'s ``model_type``, which
     is deliberately ``prism_hadamard_qwen35`` here, so reading ``tokenizer.json``
     directly is both simpler and more reliable.
+
+    Goes through ``resolve_pack`` like ``load_pack`` does, so an HF cache entry works
+    here too instead of failing on a missing ``tokenizer.json`` after the model loaded.
     """
     from tokenizers import Tokenizer
 
-    return Tokenizer.from_file(str(Path(pack_dir) / "tokenizer.json"))
+    return Tokenizer.from_file(str(resolve_pack(pack_dir) / "tokenizer.json"))
 
 
-def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = False) -> str:
+def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = False,
+                add_generation_prompt: bool = True) -> str:
     """Render a conversation through the pack's own chat template.
 
     ``conversation`` is either a single user prompt or a list of
@@ -91,17 +95,21 @@ def render_chat(pack_dir: str | Path, conversation, enable_thinking: bool = Fals
     ``enable_thinking=False`` emits a closed, empty think block so the reply is a direct
     answer. The model defaults to extended reasoning otherwise, which is usually not
     what you want when checking behaviour.
+
+    ``add_generation_prompt=False`` renders the conversation as history only, ending
+    after the last turn's ``<|im_end|>``; run.py uses that to find the exact text the
+    template appends for a new turn without re-tokenising the earlier ones.
     """
     import jinja2
 
     messages = ([{"role": "user", "content": conversation}]
                 if isinstance(conversation, str) else list(conversation))
-    template = (Path(pack_dir) / "chat_template.jinja").read_text()
+    template = (resolve_pack(pack_dir) / "chat_template.jinja").read_text()
     env = jinja2.Environment(trim_blocks=False, lstrip_blocks=False)
     env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
     return env.from_string(template).render(
         messages=messages,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
     )
 
