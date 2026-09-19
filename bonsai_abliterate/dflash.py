@@ -125,6 +125,9 @@ def _build_rope(head_dim, rope_theta, max_position_embeddings, rope_scaling):
     )
 
 
+BLOCK_CAUSAL = False  # bonsai: DFlash 2 is bidirectional inside the block; see DFlashAttention.__call__
+
+
 class DFlashAttention(nn.Module):
     def __init__(self, config: DFlashConfig, layer_idx: int):
         super().__init__()
@@ -180,10 +183,12 @@ class DFlashAttention(nn.Module):
         values = mx.concatenate([values, prop_values], axis=2)
         mask = None
         if self.is_sliding:
-            mask = (
-                "causal" if ctx_len + L <= self.sliding_window
-                else create_causal_mask(L, offset=ctx_len, window_size=self.sliding_window)
-            )
+            if ctx_len + L <= self.sliding_window:
+                # bonsai: DFlash 2 is not causal inside the block (config is_causal=false);
+                # BLOCK_CAUSAL keeps the upstream behaviour for comparison
+                mask = "causal" if BLOCK_CAUSAL else None
+            else:
+                mask = create_causal_mask(L, offset=ctx_len, window_size=self.sliding_window)
         output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
@@ -538,17 +543,25 @@ def load_drafter(drafter_dir, target_model, dtype=mx.float16):
         selector_top_k=dfl.get("selector_top_k", 0), conv_kernel_size=dfl.get("conv_kernel_size", 0),
         conv_group_size=dfl.get("conv_group_size", 16))
     model = DFlashDraftModel(config)
-    weights, meta = mx.load(str(sub / "model.safetensors"), return_metadata=True)
-    bits, gs = int(meta.get("bits", 4)), int(meta.get("group_size", 64))
-    # linears are 4-bit; the two selector codebooks (embeddings) are 8-bit in the
-    # published head (256 columns packed into 64 uint32 per row)
-    nn.quantize(model, group_size=gs, bits=bits,
-                class_predicate=lambda _p, m: isinstance(m, nn.Linear))
-    nn.quantize(model, group_size=gs, bits=8,
-                class_predicate=lambda _p, m: isinstance(m, nn.Embedding))
-    weights = {k: (v.astype(dtype) if v.dtype in (mx.bfloat16, mx.float32, mx.float16) else v)
-               for k, v in weights.items()}
-    model.load_weights(list(weights.items()), strict=True)
+    if (sub / "model.safetensors").exists():
+        weights, meta = mx.load(str(sub / "model.safetensors"), return_metadata=True)
+        bits, gs = int(meta.get("bits", 4)), int(meta.get("group_size", 64))
+        # linears are 4-bit; the two selector codebooks (embeddings) are 8-bit in the
+        # published head (256 columns packed into 64 uint32 per row)
+        nn.quantize(model, group_size=gs, bits=bits,
+                    class_predicate=lambda _p, m: isinstance(m, nn.Linear))
+        nn.quantize(model, group_size=gs, bits=8,
+                    class_predicate=lambda _p, m: isinstance(m, nn.Embedding))
+        weights = {k: (v.astype(dtype) if v.dtype in (mx.bfloat16, mx.float32, mx.float16) else v)
+                   for k, v in weights.items()}
+        model.load_weights(list(weights.items()), strict=True)
+    else:
+        # an unquantised checkpoint (model_fp16.safetensors): load, then quantise the same
+        # way the published head is, so heads compare at equal precision
+        weights = mx.load(str(sub / "model_fp16.safetensors"))
+        model.load_weights([(k, v.astype(dtype)) for k, v in weights.items()], strict=True)
+        nn.quantize(model, group_size=64, bits=4, class_predicate=lambda _p, m: isinstance(m, nn.Linear))
+        nn.quantize(model, group_size=64, bits=8, class_predicate=lambda _p, m: isinstance(m, nn.Embedding))
     model.apply(lambda a: a.astype(dtype) if a.dtype in (mx.bfloat16, mx.float32) else a)
     model.bind(target_model)
     mx.eval(model.parameters())

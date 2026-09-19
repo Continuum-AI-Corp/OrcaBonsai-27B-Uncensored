@@ -256,13 +256,30 @@ handles up to 8 tokens per call with the recurrent state in registers; and rollb
 replays the accepted prefix through that kernel from recorded inputs instead of
 snapshotting per-position states (1.2 GB per round on the runtime's own path).
 
-Measured on an M1 Ultra, ablation on, `--max-new 300`:
+Two things raise acceptance beyond the published head as-is. The vendored drafter (like
+mlx-dspark and chad) applied a causal mask inside the draft block; DFlash 2 is not causal
+there (`is_causal: false`), and letting the block attend to itself measured +0.3–0.5
+tokens per round on every prompt tried. And a head fine-tuned against the ternary target
+exists: [ProCreations/Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
+(Apache-2.0, GGUF); `scripts/convert_dflash_gguf.py` turns it into a `--draft` directory
+and it accepts about one more token per round on code than the unadapted head, even with
+the ablation on, which it was not trained against.
+
+```text
+tokens accepted per round        unadapted head    causal block     ternary-tuned head
+code (CSV parser function)       4.43              4.97             5.73
+edit (add type hints)            6.47              6.80             7.07
+Chinese essay                    1.50              1.63             1.73
+```
+
+Measured on an M1 Ultra, ablation on, `--max-new 300`, ternary-tuned head:
 
 ```text
                                    plain      --draft
-code (CSV parser function)         27.7       39.0 tok/s   60 rounds, 4.98 tokens/round
-follow-up turn on the same code    27.5       44.4 tok/s   5.45 tokens/round
-Chinese essay                      26.8       26.8 tok/s   gave up after 10 rounds at 2.0
+code (CSV parser function)         29.1       44.6 tok/s   53 rounds, 5.64 tokens/round
+edit (add type hints)              25.4       45.0 tok/s   7.46 tokens/round
+follow-up turn on the same code    27.5       44–47 tok/s
+Chinese essay                      26.8       28.4 tok/s   gave up after 10 rounds at 2.3
 ```
 
 A round costs about 3.3 plain steps (draft ~16 ms, verify ~100 ms against a 36 ms
@@ -300,6 +317,20 @@ own split of the same text (the effect that also rules out re-tokenising history
 cache), so identical text is still rejected at token level. Copies of the model's own
 earlier output match exactly, but those are the spans the drafter handles best. Kept as
 an option for drafter-less setups; off by default.
+
+**Integer activations (W2A8), measured but not integrated.** The one way left to make
+the matmuls themselves cheaper on this GPU is to quantise the rotated activations to
+int8 and turn the ternary dot product into AND + popcount over bit-planes. A probe
+kernel (`+1`/`-1` weight bitmasks derived in memory from the pack's codes, 8 activation
+planes per 32 weights, integer sums folded per 128-group) measured, interleaved with
+the stock kernel on a cool GPU: up_proj 1.47x, down_proj 1.66x, qkv 1.30x, o_proj 1.30x,
+so about 1.45x on the step's matmuls, ~20 → ~14 ms. The numerical cost was measured by
+simulating the same int8 rounding on every projection input: over 300-token replies
+the argmax agreed with the fp16 path at 99.7–100% of positions, mean KL 0.0001 nats,
+and the fp16 choice's probability was unchanged to three decimals; greedy text still
+diverges after a few dozen tokens at near-ties. It is not wired in because it changes
+outputs, which this repository promises not to do; the probe is what a decision to
+accept that should start from.
 
 The M1 family has no matrix hardware in the GPU, so the tile matmul is 2.7x slower than
 the stock kernel at one row and is used only for 4–8 rows; on chips with matrix units
